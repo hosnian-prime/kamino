@@ -149,8 +149,9 @@ Rust's type system enforces:
 
 - All shared state implements `Send + Sync`
 - No data races possible (checked at compile time)
-- Lock ordering is enforced by the borrow checker
 - `Arc<RwLock<T>>` for shared mutable state across tasks
+
+**Note**: Data race freedom is guaranteed by the compiler. Lock **ordering** (routing table -> service -> fragment -> key) is a convention enforced by code review — the borrow checker does not prevent deadlocks caused by acquiring locks in the wrong order.
 
 ## Deadlock Prevention
 

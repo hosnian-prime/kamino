@@ -66,6 +66,11 @@ idle_close = "0s"
 [auth]
 # Password for client authentication (empty = no auth)
 password = ""
+
+# Shared secret for inter-node (server-to-server) authentication.
+# Prevents arbitrary RESP clients from issuing INTERNAL.NODE.* commands.
+# Must be identical across all cluster members.
+cluster_secret = ""
 ```
 
 ### Discovery Settings
@@ -97,6 +102,24 @@ leave_timeout = "5s"
 # plugin = "consul"
 # plugin = "kubernetes"
 # plugin = "dns"
+```
+
+### SWIM Protocol Tuning
+
+```toml
+[swim]
+# How often each node probes a random peer
+probe_interval = "1s"
+
+# How long to wait for a direct probe response
+probe_timeout = "500ms"
+
+# Number of proxy nodes for indirect probing (higher = fewer false positives)
+indirect_probes = 3
+
+# Multiplier for suspicion timeout before declaring a suspected node dead.
+# Actual timeout = suspicion_multiplier * log(N) * probe_interval
+suspicion_multiplier = 5
 ```
 
 ### Storage Engine Settings
@@ -278,6 +301,11 @@ let config = Config {
 | `balancer_trigger_interval` | 15s |
 | `compaction_interval` | 10m |
 | `empty_fragments_check` | 60s |
+| `cluster_secret` | "" (no auth) |
+| `swim_probe_interval` | 1s |
+| `swim_probe_timeout` | 500ms |
+| `swim_indirect_probes` | 3 |
+| `swim_suspicion_multiplier` | 5 |
 | `storage_engine` | ramblock |
 | `table_size` | 1 MB |
 | `max_garbage_ratio` | 0.40 |
@@ -299,7 +327,9 @@ replica_count = 2
 write_quorum = 2
 
 # Was: 1. Production: majority of expected cluster size.
-# Example: N=3 → 2, N=5 → 3, N=7 → 4. Prevents minority-partition writes.
+# Example: N=3 → 2, N=5 → 3, N=7 → 4. Prevents minority-partition writes
+# AND ensures routing table correctness during network partitions
+# (the scalar signature mechanism alone is not sufficient — see docs/03-cluster-management.md).
 member_count_quorum = 2   # for a 3-node cluster
 
 # Was: false. Recommended ON if cross-DC or replica drift is a concern.

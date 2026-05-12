@@ -109,18 +109,19 @@ When `read_repair` is enabled:
 5. Returns the winning version to the client
 
 ```rust
-fn get_with_read_repair(&self, key: &str) -> Result<Entry> {
-    let versions = vec![];
-    versions.push(self.get_local(key)?);          // primary
-    versions.extend(self.get_from_backups(key)?);  // backups
-    versions.extend(self.get_from_previous(key)?); // previous owners
+// Simplified pseudo-code — actual implementation is fully async
+async fn get_with_read_repair(&self, key: &str) -> Result<Entry> {
+    let mut versions = vec![];
+    versions.push(self.get_local(key).await?);          // primary
+    versions.extend(self.get_from_backups(key).await?);  // backups
+    versions.extend(self.get_from_previous(key).await?); // previous owners
 
     let winner = versions.into_iter()
         .max_by_key(|v| v.timestamp)
         .ok_or(Error::KeyNotFound)?;
 
     // Propagate winner to stale replicas
-    self.repair_stale_replicas(&winner)?;
+    self.repair_stale_replicas(&winner).await?;
 
     Ok(winner)
 }
@@ -155,7 +156,7 @@ fn merge(local: &Entry, remote: &Entry) -> &Entry {
 
 ### Timestamp Source
 
-- **Default**: Server-assigned by the **partition primary** at write acceptance, using the local monotonic clock anchored to wall-clock time. This means a single primary's writes are totally ordered by timestamp.
+- **Default**: Server-assigned by the **partition primary** at write acceptance, using a monotonized wall clock — effectively `max(previous_timestamp + 1, current_wall_time)`. This is a simplified Hybrid Logical Clock (Kulkarni et al., 2014): it tracks wall-clock time but never goes backward on a single node, ensuring a single primary's writes are totally ordered by timestamp.
 - **Optional client override**: The `PutOptions.timestamp: Option<i64>` field lets callers supply a timestamp explicitly (for replication tools, replay, or external HLC integration). Use with care — a client that writes a far-future timestamp will block all subsequent writes for that key until the timestamp is exceeded.
 
 ### Failure Mode: Cross-Primary Clock Skew
@@ -168,7 +169,7 @@ Under a network partition, both sides may accept writes through their own primar
 
 ### LWW Silently Drops Concurrent Writes
 
-LWW is a **lost-write** strategy by design: if two clients write to the same key at the same nanosecond (or under clock skew, in any order), one write disappears with no error returned to the loser. This is acceptable for cache workloads (most-recent value usually wins) but is **not** suitable for ledger-style accounting, financial state, or any workload where lost writes are a correctness violation.
+LWW is a **lost-write** strategy by design (Shapiro et al., 2011): if two clients write to the same key at the same nanosecond (or under clock skew, in any order), one write disappears with no error returned to the loser. The resolution is deterministic (highest timestamp always wins) but the timestamp order may diverge from real-time causal order due to clock skew. LWW provides **strong eventual consistency** (all replicas converge to the same value) but not linearizability. This is acceptable for cache workloads (most-recent value usually wins) but is **not** suitable for ledger-style accounting, financial state, or any workload where lost writes are a correctness violation.
 
 ### INCR/DECR Lost-Update Warning
 

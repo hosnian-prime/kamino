@@ -2,7 +2,7 @@
 
 ## Overview
 
-Kamino's default storage engine is **RamBlock** - a GC-free (Rust has no GC, but the design avoids excessive allocations), append-only, in-memory storage engine optimized for cache workloads.
+Kamino's default storage engine is **RamBlock** — a GC-free (Rust has no GC, but the design avoids excessive allocations), append-only, in-memory storage engine optimized for cache workloads. The design follows the Bitcask model (Basho/Riak, 2010): append-only writes with an in-memory hash index mapping keys to byte offsets, and periodic compaction to reclaim garbage space.
 
 ## Design Principles
 
@@ -86,7 +86,7 @@ Each entry is serialized as a compact binary structure:
 | `key_length` | 1 byte | u8 | Key length (max 255 bytes) |
 | `key` | variable | [u8] | Raw key bytes |
 | `ttl` | 8 bytes | i64 | Time-to-live in nanoseconds (0 = no expiry) |
-| `timestamp` | 8 bytes | i64 | Entry creation/update timestamp (for LWW). **Assigned by the partition primary at write acceptance** from the local monotonic clock anchored to wall-time. May be overridden by the client via `PutOptions.timestamp` for replay or external HLC integration. |
+| `timestamp` | 8 bytes | i64 | Entry creation/update timestamp (for LWW). **Assigned by the partition primary at write acceptance** using a monotonized wall clock (`max(prev_ts + 1, wall_time)` — a simplified HLC). May be overridden by the client via `PutOptions.timestamp` for replay or external HLC integration. |
 | `last_access` | 8 bytes | i64 | Last access timestamp (for LRU eviction) |
 | `value_length` | 4 bytes | u32 | Value length |
 | `value` | variable | [u8] | Raw value bytes |
@@ -210,7 +210,8 @@ The `len()` and `inuse()` accessors remain synchronous because they are O(1) ato
 Each DMap can override global storage settings:
 
 ```toml
-[dmaps.sessions]
+[[dmaps]]
+name = "sessions"
 max_idle_duration = "30m"
 ttl = "24h"
 max_keys = 1000000

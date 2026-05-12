@@ -2,11 +2,12 @@
 
 ## Membership Protocol: SWIM
 
-Kamino uses the **SWIM** (Scalable Weakly-consistent Infection-style process group Membership) protocol for decentralized cluster membership. SWIM provides:
+Kamino uses the **SWIM** (Scalable Weakly-consistent Infection-style process group Membership) protocol for decentralized cluster membership (Das, Gupta, Motivala, 2002). SWIM provides:
 
-- **O(log N) convergence** for membership changes
-- **Bounded false-positive rate** for failure detection
-- **No single point of failure** - fully decentralized
+- **O(1) failure detection** — a node failure is first detected in an expected constant number of protocol periods (~1.58), independent of cluster size
+- **O(log N) dissemination** — once detected, a membership change propagates to all members in O(log N) protocol periods via epidemic-style piggybacking
+- **Configurable false-positive rate** — tunable via indirect probe count (`k`) and suspicion timeout; not a fixed guarantee but a configurable bound
+- **No single point of failure** — fully decentralized
 
 ## Protocol Mechanics
 
@@ -65,19 +66,22 @@ Pluggable discovery backends for:
 - Custom implementations via trait
 
 ```rust
+#[async_trait]
 pub trait DiscoveryPlugin: Send + Sync {
     /// Initialize the plugin
-    fn init(&mut self) -> Result<()>;
+    async fn init(&mut self) -> Result<()>;
     /// Register this node
-    fn register(&self) -> Result<()>;
+    async fn register(&self) -> Result<()>;
     /// Deregister this node
-    fn deregister(&self) -> Result<()>;
+    async fn deregister(&self) -> Result<()>;
     /// Discover peer addresses
-    fn discover(&self) -> Result<Vec<SocketAddr>>;
+    async fn discover(&self) -> Result<Vec<SocketAddr>>;
     /// Shutdown the plugin
-    fn shutdown(&self) -> Result<()>;
+    async fn shutdown(&self) -> Result<()>;
 }
 ```
+
+Methods are async to support plugins that perform network I/O (e.g., Kubernetes Endpoints API, Consul HTTP API).
 
 ## Join Process
 
@@ -137,10 +141,17 @@ There is no election protocol. Every node sorts its local member list and picks 
 
 1. The coordinator increments `signature` on every topology change.
 2. Receivers reject any routing table whose signature is ≤ their current signature.
-3. The "real" coordinator's signature pulls ahead because it sees the topology change first (after SWIM converges, the wrong coordinator stops generating new tables — its view is stale, so its signature stops advancing).
-4. After SWIM convergence (typically within a few probe intervals), only one node has the correct, latest member set and therefore produces the highest-signature table.
+3. After SWIM convergence (typically within a few probe intervals), only one node has the correct, latest member set and therefore produces the highest-signature table. The wrong coordinator stops seeing topology changes, so its signature stops advancing.
 
-This is **not Paxos/Raft** and provides no liveness guarantee during sustained network instability — but for transient SWIM convergence (sub-second), the signature mechanism is sufficient.
+**Limitation — transient disagreement only.** The signature mechanism is a scalar clock (equivalent to a Lamport scalar). It is sufficient for brief SWIM convergence windows (sub-second) but **not for sustained network partitions**:
+
+- During a partition, the minority-side coordinator may fall behind in signature even if it holds the "correct" pre-partition member list.
+- The majority-side coordinator accumulates higher signatures (it sees more topology changes) and its routing table wins after heal — regardless of which side's member list is more complete.
+- A scalar clock cannot distinguish concurrent coordinators (Fidge 1988, Mattern 1988). A `(coordinator_id, sequence)` epoch scheme would be more robust but is not currently implemented.
+
+**Mitigation**: Set `member_count_quorum` to a majority value. This prevents the minority side from accepting writes **and** ensures the majority-side coordinator's routing table is authoritative (it has the quorum). Without `member_count_quorum`, the signature mechanism alone does not guarantee routing table correctness during sustained partitions.
+
+This is **not Paxos/Raft** and provides no liveness guarantee during sustained network instability.
 
 ### Coordinator Responsibilities
 

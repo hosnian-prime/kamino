@@ -41,7 +41,7 @@ pub struct KubernetesDiscovery {
 }
 
 impl DiscoveryPlugin for KubernetesDiscovery {
-    fn init(&mut self) -> Result<()> {
+    async fn init(&mut self) -> Result<()> {
         // Uses in-cluster config automatically:
         // - Service account token from /var/run/secrets/kubernetes.io/serviceaccount/token
         // - API server address from KUBERNETES_SERVICE_HOST env var
@@ -49,7 +49,7 @@ impl DiscoveryPlugin for KubernetesDiscovery {
         Ok(())
     }
 
-    fn discover(&self) -> Result<Vec<SocketAddr>> {
+    async fn discover(&self) -> Result<Vec<SocketAddr>> {
         // GET /api/v1/namespaces/{ns}/endpoints/{service}
         // Returns all ready pod IPs from the Endpoints resource
         let endpoints = self.kube_client
@@ -64,12 +64,12 @@ impl DiscoveryPlugin for KubernetesDiscovery {
         Ok(addrs)
     }
 
-    fn register(&self) -> Result<()> {
+    async fn register(&self) -> Result<()> {
         // No-op: K8s manages Endpoints automatically via readiness probe
         Ok(())
     }
 
-    fn deregister(&self) -> Result<()> {
+    async fn deregister(&self) -> Result<()> {
         // No-op: K8s removes from Endpoints when pod terminates
         Ok(())
     }
@@ -140,11 +140,13 @@ Single resource, single verb, namespace-scoped. Minimal surface.
 ```toml
 [discovery]
 plugin = "kubernetes"
-kubernetes_namespace = "default"       # or read from downward API
-kubernetes_service = "kamino"
+kubernetes_namespace = "default"       # or set via KAMINO_KUBERNETES_NAMESPACE env var (recommended: use downward API)
+kubernetes_service = "kamino"          # service name only, not FQDN — the Endpoints API uses namespace + name
 label_selector = "app=kamino"
 bind_port = 3322
 ```
+
+**Namespace resolution order**: (1) `KAMINO_KUBERNETES_NAMESPACE` env var, (2) `kubernetes_namespace` config field, (3) fallback: read from `/var/run/secrets/kubernetes.io/serviceaccount/namespace` (auto-mounted by K8s).
 
 ## Kubernetes Manifests
 
@@ -208,7 +210,11 @@ spec:
             - name: KAMINO_DISCOVERY_PLUGIN
               value: "kubernetes"
             - name: KAMINO_KUBERNETES_SERVICE
-              value: "kamino.default.svc.cluster.local"
+              value: "kamino"
+            - name: KAMINO_KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           readinessProbe:
             # CLUSTER.READY returns +OK only when this node has joined the SWIM cluster,
             # received a routing table (signature > 0), and meets member_count_quorum.
@@ -252,6 +258,8 @@ When Kubernetes sends `SIGTERM` (pod termination, rolling update, scale-down):
 ```
 
 `terminationGracePeriodSeconds` in the StatefulSet should be greater than `leave_timeout` to allow migration to complete before `SIGKILL`.
+
+> **Production note**: The default `leave_timeout = 5s` may be too short for nodes holding significant data (hundreds of MB). Data migration must complete within `leave_timeout` — Kamino exits after this deadline regardless of migration progress. Increase `leave_timeout` for production workloads and set `terminationGracePeriodSeconds` accordingly (e.g., `leave_timeout = 25s`, `terminationGracePeriodSeconds = 30`).
 
 ## Probes
 

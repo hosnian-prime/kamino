@@ -224,6 +224,20 @@ Scan is intentionally partition-scoped. Iterating partitions in parallel is safe
 ## Pipeline
 
 ```rust
+pub struct PipelineOptions {
+    /// Maximum number of concurrent operations when executing the pipeline.
+    /// Commands targeting different nodes run in parallel up to this limit.
+    pub concurrency: usize,
+}
+
+impl Default for PipelineOptions {
+    fn default() -> Self {
+        Self { concurrency: 4 }
+    }
+}
+```
+
+```rust
 pub struct Pipeline {
     operations: Vec<PipelineOp>,
     concurrency: usize,
@@ -286,6 +300,9 @@ pub enum Error {
     LockNotAcquired,
     /// Invalid lock token on unlock
     NoSuchLock,
+    /// Scan cursor invalidated (partition migrated between scan calls).
+    /// Restart the scan for that partition from cursor 0.
+    InvalidCursor,
     /// Cluster quorum not met
     ClusterQuorum,
     /// Server is shutting down

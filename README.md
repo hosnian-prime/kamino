@@ -34,7 +34,7 @@ let val = cache.get("user:1").await?;
 kamino-server --config kamino.toml
 ```
 
-Connect with any Redis client on port 3320.
+Connect using any Redis client's raw command API on port 3320. Standard Redis commands (SET, GET, DEL) are not supported — use the `DM.*` command set. Pub/Sub uses standard Redis syntax.
 
 ## Cluster
 

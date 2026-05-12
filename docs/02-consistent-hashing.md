@@ -2,21 +2,23 @@
 
 ## Overview
 
-Kamino uses **consistent hashing with bounded loads** to distribute data across cluster nodes. This algorithm, based on research by Mirrokni et al., ensures that no single node receives disproportionately more data than others, while maintaining the stability properties of traditional consistent hashing.
+Kamino uses **consistent hashing with bounded loads** to distribute data across cluster nodes. This algorithm is based on the paper *"Consistent Hashing with Bounded Loads"* by Vahab Mirrokni, Mikkel Thorup, and Morteza Zadimoghaddam (arXiv:1608.01350, 2016). It ensures that no single node receives disproportionately more data than others, while maintaining the stability properties of traditional consistent hashing.
 
 ## Algorithm
 
 ### Bounded-Load Consistent Hashing
 
-Traditional consistent hashing can lead to uneven load distribution. Bounded-load consistent hashing adds a constraint: each node's load cannot exceed `average_load * load_factor`. When a node would exceed this threshold, the key is assigned to the next node on the ring that has capacity.
+Traditional consistent hashing can lead to uneven load distribution. Bounded-load consistent hashing adds a constraint: each node's load cannot exceed `average_load * load_factor`. During ring construction, when a node would exceed this threshold, the **partition** is assigned to the next node on the ring that has capacity.
+
+Kamino uses a two-level scheme adapted from the paper: (1) members are placed on the ring as virtual nodes, (2) partitions are assigned to the nearest member with capacity, and (3) keys are mapped to partitions via `hash(key) % partition_count`. The ring walk happens at partition-assignment time, not at key-lookup time.
 
 **Parameters:**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `partition_count` | 271 | Total number of partitions (should be prime) |
-| `replication_factor` | 20 | Virtual nodes per physical member on the hash ring |
-| `load_factor` | 1.25 | Maximum load ratio relative to average |
+| `virtual_nodes_per_member` | 20 | Virtual nodes per physical member on the hash ring (more = better distribution, more memory) |
+| `load_factor` | 1.25 | Maximum load ratio relative to average (practical recommendation; the paper analyzes the trade-off as `1 + epsilon`) |
 
 ### Why 271 Partitions?
 
@@ -69,9 +71,9 @@ The consistent hash ring maps partition IDs to physical nodes:
 
 ```
 Ring:
-  Node-A: virtual nodes at positions [v0, v1, ..., v19]
-  Node-B: virtual nodes at positions [v0, v1, ..., v19]
-  Node-C: virtual nodes at positions [v0, v1, ..., v19]
+  Node-A: 20 virtual nodes at positions [v0, v1, ..., v19]
+  Node-B: 20 virtual nodes at positions [v0, v1, ..., v19]
+  Node-C: 20 virtual nodes at positions [v0, v1, ..., v19]
 
 Partition 142 → closest virtual node → Node-B (primary owner)
                 next closest node    → Node-C (backup owner #1)
@@ -90,7 +92,7 @@ When a node joins or leaves:
 
 ### Minimal Disruption
 
-With consistent hashing, only `K/N` partitions need to move on average when a node is added/removed (where K = partition count, N = node count). This is near-optimal.
+With consistent hashing, only `K/N` partitions need to move on average when a node is added/removed (where K = partition count, N = node count). This is near-optimal and is a property of standard consistent hashing (Karger et al., 1997). The bounded-load extension may require a small number of additional moves — `O(1/epsilon^2)` per topology change — to maintain the load constraint.
 
 ### Fragmented Partitions
 
@@ -116,16 +118,19 @@ pub struct RoutingTable {
     backup: HashMap<u32, Vec<Member>>,
     /// Current cluster members, sorted by (birthdate ASC, id ASC). Index 0 is the coordinator.
     members: Vec<Member>,
-    /// Monotonic version assigned by the coordinator. Incremented on every topology change.
-    /// Nodes and clients compare signatures to detect stale routing tables: a received
-    /// routing table is accepted only if its signature is strictly greater than the locally
-    /// stored one. This is the conflict resolution mechanism when multiple nodes briefly
-    /// believe themselves to be the coordinator during SWIM convergence.
+    /// Monotonic version (scalar clock) assigned by the coordinator. Incremented on every
+    /// topology change. Nodes and clients compare signatures to detect stale routing tables:
+    /// a received routing table is accepted only if its signature is strictly greater than the
+    /// locally stored one.
+    ///
+    /// **Limitation**: This is a scalar clock — sufficient for transient dual-coordinator
+    /// episodes during SWIM convergence, but not for sustained network partitions. See
+    /// [Cluster Management](03-cluster-management.md#election-eventually-consistent) for details.
     signature: u64,
 }
 ```
 
-The routing table is serialized with MessagePack for efficient wire transfer. The `signature` field is the single source of truth for table freshness — any handler that receives a `CLUSTER.ROUTINGTABLE` or `INTERNAL.NODE.UPDATEROUTING` message ignores it if its signature is ≤ the local signature, which keeps stale broadcasts from corrupting the local view during a coordinator transition.
+The routing table is serialized with MessagePack for efficient wire transfer. The `signature` field is the primary freshness indicator — any handler that receives a `CLUSTER.ROUTINGTABLE` or `INTERNAL.NODE.UPDATEROUTING` message ignores it if its signature is ≤ the local signature, which keeps stale broadcasts from corrupting the local view during transient coordinator transitions. For sustained partitions, `member_count_quorum` is the authoritative protection mechanism (see [Cluster Management](03-cluster-management.md#election-eventually-consistent)).
 
 ## Client-Side Routing
 

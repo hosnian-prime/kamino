@@ -27,8 +27,12 @@ Kamino is a **primary-routed, eventually consistent** distributed cache:
 
 - **Single-primary serialization**: Each partition has exactly one primary owner; all writes for a partition are serialized through that primary.
 - **Replication**: Optional synchronous or asynchronous replication to backup owners (when `replica_count > 1`).
-- **Conflict resolution**: Last-Write-Wins (LWW) by server-assigned timestamp. Concurrent writes to different primaries (during a network partition) resolve via LWW after the partition heals — **the loser is silently dropped**.
-- **PACELC classification**: **PA/EL** — under Partition, prefers Availability; Else, prefers Latency (tunable via `replication_mode` and quorum settings). Strong consistency (linearizability) is **not** provided even with quorum settings, because LWW resolves conflicts non-deterministically with respect to client wall-clock order.
+- **Conflict resolution**: Last-Write-Wins (LWW) by server-assigned timestamp. Concurrent writes to different primaries (during a network partition) resolve via LWW after the partition heals — **the loser is silently dropped**. LWW is deterministic (highest timestamp always wins) but the timestamp order may diverge from real-time causal order due to clock skew between primaries.
+- **PACELC classification** (tunable via quorum settings):
+  - **Default** (`member_count_quorum=1`, `write_quorum=1`): **PA/EL** — under Partition, prefers Availability; Else, prefers Latency.
+  - **With `member_count_quorum=majority`**: **PC/EL** — minority partitions reject writes; majority side continues with low latency.
+  - **With `member_count_quorum=majority` + `write_quorum=replica_count`**: **PC/EC** — strongest consistency, highest latency.
+  Strong consistency (linearizability) is **not** provided even with quorum settings, because LWW resolves conflicts by timestamp order, which may diverge from real-time causal order due to clock skew (see [Replication](04-replication.md#failure-mode-cross-primary-clock-skew)).
 - **Split-brain protection**: Set `member_count_quorum` to a majority value to prevent minority partitions from accepting writes.
 
 ## Architecture at a Glance

@@ -4,7 +4,7 @@
 
 Kamino uses the **RESP (Redis Serialization Protocol)** for all communication - both client-to-server and server-to-server. This provides:
 
-- **Redis ecosystem compatibility**: Any RESP client library can communicate with Kamino
+- **RESP transport compatibility**: Any RESP client library can communicate with Kamino using its raw/generic command API (e.g., `execute_command` in redis-py, `sendCommand` in node-redis). **Standard Redis commands (SET, GET, DEL) are not supported** — use the DM.* command set instead. Pub/Sub commands (SUBSCRIBE, PUBLISH, etc.) use standard Redis syntax.
 - **Simplicity**: Text-based protocol, easy to debug with standard tools
 - **Performance**: Efficient binary-safe encoding with minimal overhead
 - **Proven at scale**: Battle-tested protocol used by millions of Redis deployments
@@ -112,6 +112,8 @@ There is no built-in TLS for either client or inter-node traffic. **Both the cli
 |---------|-------------|
 | `PING` | Health check |
 | `AUTH` | Authenticate connection |
+| `HELLO` | Protocol version handshake. `HELLO 3` upgrades the connection to RESP3 (enables push frames for pub/sub). |
+| `QUIT` | Close the connection gracefully |
 | `STATS` | Node statistics and metrics |
 
 ## Inter-Node Communication
