@@ -162,8 +162,13 @@ spec:
   ports:
     - name: resp
       port: 3320
-    - name: gossip
+      protocol: TCP
+    - name: gossip-tcp
       port: 3322
+      protocol: TCP
+    - name: gossip-udp
+      port: 3322
+      protocol: UDP        # SWIM uses both TCP and UDP on the same port; both must be declared
 ```
 
 ### StatefulSet
@@ -192,19 +197,35 @@ spec:
           ports:
             - containerPort: 3320
               name: resp
+              protocol: TCP
             - containerPort: 3322
-              name: gossip
+              name: gossip-tcp
+              protocol: TCP
+            - containerPort: 3322
+              name: gossip-udp
+              protocol: UDP
           env:
             - name: KAMINO_DISCOVERY_PLUGIN
               value: "kubernetes"
             - name: KAMINO_KUBERNETES_SERVICE
               value: "kamino.default.svc.cluster.local"
           readinessProbe:
-            tcpSocket:
-              port: 3320
+            # CLUSTER.READY returns +OK only when this node has joined the SWIM cluster,
+            # received a routing table (signature > 0), and meets member_count_quorum.
+            # A TCP-only probe would mark the pod ready while it is still rejecting writes
+            # with ErrClusterQuorum — see docs/06-network-protocol.md#cluster-commands.
+            exec:
+              command:
+                - redis-cli
+                - -p
+                - "3320"
+                - CLUSTER.READY
             initialDelaySeconds: 5
             periodSeconds: 5
+            failureThreshold: 3
           livenessProbe:
+            # Liveness only checks process responsiveness — a node may be unable to serve
+            # writes (quorum lost) but still be alive and recoverable. Don't kill it for that.
             tcpSocket:
               port: 3320
             initialDelaySeconds: 15
@@ -234,12 +255,12 @@ When Kubernetes sends `SIGTERM` (pod termination, rolling update, scale-down):
 
 ## Probes
 
-Simple TCP checks on the RESP port are sufficient:
+| Probe | Mechanism | What it actually verifies |
+|-------|-----------|----------------------------|
+| Readiness | `exec: redis-cli CLUSTER.READY` | Node has joined SWIM, received a routing table, and meets `member_count_quorum`. If any of these fail, the pod is marked `NotReady` and the headless Service stops returning its IP. |
+| Liveness | `tcpSocket: 3320` | Process is alive and the RESP listener is accepting connections. Insufficient as a readiness signal (the listener accepts even when the node would reject writes for quorum reasons), but appropriate for liveness — losing quorum should not kill the process. |
 
-- **Readiness**: Is the node accepting connections? (joined cluster, routing table received)
-- **Liveness**: Is the process alive and responsive?
-
-Both use `tcpSocket` on port 3320. No custom HTTP health endpoint needed — if the RESP server accepts TCP connections, the node is operational.
+Do **not** use `tcpSocket` for readiness. The original instinct ("if it accepts TCP it's ready") is wrong for any distributed system that has a notion of cluster-level readiness: a freshly started pod accepts TCP within milliseconds but is not actually ready to serve traffic until it has joined SWIM and received a routing table. Misconfiguring this is one of the most common ways to lose traffic during rolling restarts.
 
 ## Scaling
 

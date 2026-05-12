@@ -109,18 +109,23 @@ Partition 42:
 
 ```rust
 pub struct RoutingTable {
-    /// Mapping from partition ID to list of owners (newest first)
+    /// Mapping from partition ID to list of owners (newest first).
+    /// During topology transitions, a partition may have multiple owners (fragmented).
     primary: HashMap<u32, Vec<Member>>,
-    /// Mapping from partition ID to list of backup owners
+    /// Mapping from partition ID to list of backup owners (closest N on the ring, excluding the primary).
     backup: HashMap<u32, Vec<Member>>,
-    /// Current cluster members
+    /// Current cluster members, sorted by (birthdate ASC, id ASC). Index 0 is the coordinator.
     members: Vec<Member>,
-    /// Signature/version for change detection
+    /// Monotonic version assigned by the coordinator. Incremented on every topology change.
+    /// Nodes and clients compare signatures to detect stale routing tables: a received
+    /// routing table is accepted only if its signature is strictly greater than the locally
+    /// stored one. This is the conflict resolution mechanism when multiple nodes briefly
+    /// believe themselves to be the coordinator during SWIM convergence.
     signature: u64,
 }
 ```
 
-The routing table is serialized using MessagePack for efficient wire transfer between nodes.
+The routing table is serialized with MessagePack for efficient wire transfer. The `signature` field is the single source of truth for table freshness — any handler that receives a `CLUSTER.ROUTINGTABLE` or `INTERNAL.NODE.UPDATEROUTING` message ignores it if its signature is ≤ the local signature, which keeps stale broadcasts from corrupting the local view during a coordinator transition.
 
 ## Client-Side Routing
 

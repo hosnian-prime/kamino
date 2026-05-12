@@ -12,6 +12,8 @@ Write Request
                  ──replicate──>  [Backup Owner #2]
 ```
 
+> **⚠️ Default `replica_count = 1` is NOT fault-tolerant.** With the shipped default, each partition has only one copy and no backups. If the owning node fails, all data in that partition is **permanently lost**. For any production deployment, set `replica_count >= 2` and `write_quorum >= 2`. See [Production-Recommended Defaults](09-configuration.md#production-recommended-defaults).
+
 ## Configuration
 
 | Parameter | Default | Description |
@@ -143,16 +145,33 @@ When quorum is not met, all DMap operations return `ErrClusterQuorum`.
 
 ## Conflict Resolution: Last-Write-Wins (LWW)
 
-All entries carry a client-attached timestamp. When conflicts arise (e.g., during read-repair, merge after partition heal, or ownership transfer), the entry with the **highest timestamp** wins:
+All entries carry a `timestamp` field used for conflict resolution. Conflicts arise during read-repair, merge after partition heal, ownership transfer between primaries, or fragmented-partition resolution. The entry with the **highest timestamp** wins; the loser is discarded.
 
 ```rust
-fn merge(&self, local: &Entry, remote: &Entry) -> &Entry {
-    if remote.timestamp > local.timestamp {
-        remote
-    } else {
-        local
-    }
+fn merge(local: &Entry, remote: &Entry) -> &Entry {
+    if remote.timestamp > local.timestamp { remote } else { local }
 }
 ```
 
-This is a simple, partition-tolerant conflict resolution strategy suitable for caching workloads where "most recent value" is typically the correct value.
+### Timestamp Source
+
+- **Default**: Server-assigned by the **partition primary** at write acceptance, using the local monotonic clock anchored to wall-clock time. This means a single primary's writes are totally ordered by timestamp.
+- **Optional client override**: The `PutOptions.timestamp: Option<i64>` field lets callers supply a timestamp explicitly (for replication tools, replay, or external HLC integration). Use with care — a client that writes a far-future timestamp will block all subsequent writes for that key until the timestamp is exceeded.
+
+### Failure Mode: Cross-Primary Clock Skew
+
+Under a network partition, both sides may accept writes through their own primaries. On heal, LWW compares timestamps from the two primaries' clocks. If the clocks are skewed (e.g., NTP failure), the side with the faster clock wins **regardless of which write happened later in real time**. Mitigations:
+
+- Require NTP on all nodes; alert on drift > 50ms.
+- For partition-safety, set `member_count_quorum = majority` — the minority side rejects writes, eliminating cross-primary conflicts entirely.
+- For application-critical counters, see the warning in [INCR/DECR Lost-Update](#incrdecr-lost-update-warning) below.
+
+### LWW Silently Drops Concurrent Writes
+
+LWW is a **lost-write** strategy by design: if two clients write to the same key at the same nanosecond (or under clock skew, in any order), one write disappears with no error returned to the loser. This is acceptable for cache workloads (most-recent value usually wins) but is **not** suitable for ledger-style accounting, financial state, or any workload where lost writes are a correctness violation.
+
+### INCR/DECR Lost-Update Warning
+
+`INCR`, `DECR`, and `INCRBYFLOAT` are serialized at the partition primary via key-level locks — atomic on a single primary. They are **not atomic across the cluster** under partition. With `member_count_quorum < majority`, two partitioned primaries may each accept increments; on heal, LWW keeps only the entry with the higher timestamp, so the other partition's increments are **lost** (not added, simply discarded).
+
+For partition-safe counters, set `member_count_quorum` to a majority value, accepting the trade-off that minority partitions reject all writes. A CRDT PN-Counter is not yet implemented and would be the proper solution for fully partition-tolerant counters.

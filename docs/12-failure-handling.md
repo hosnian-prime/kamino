@@ -70,9 +70,10 @@ Node-C already has the data from backup replication.
 No data migration needed for this partition.
 ```
 
-If `replica_count == 1` (no backups):
-- Data on the dead node is **permanently lost**
-- Affected partitions return `ErrKeyNotFound` for previously stored keys
+If `replica_count == 1` (the **shipped default**):
+- There are no backups. Data on the dead node is **permanently lost** the moment SWIM declares it dead.
+- All affected partitions return `ErrKeyNotFound` for previously stored keys.
+- **This is the failure mode of the default configuration.** Any production deployment that values its cached data must override to `replica_count >= 2`. See [Production-Recommended Defaults](09-configuration.md#production-recommended-defaults).
 
 ### Step 4: Balancer Migration
 
@@ -244,6 +245,28 @@ For each local partition:
 ```
 
 This catches any data that should have been migrated but wasn't (e.g., due to transient failures during a previous migration).
+
+## Lost-Update Under Partition: INCR/DECR
+
+`INCR`, `DECR`, and `INCRBYFLOAT` are serialized at the partition primary but are not cluster-wide atomic during a network partition. Concrete scenario:
+
+```
+Initial state: counter:requests = 100
+
+Network partition splits cluster:
+  Group A: client_a issues INCR counter:requests 5   → stored as (105, ts=T1)
+  Group B: client_b issues INCR counter:requests 3   → stored as (103, ts=T2)
+
+Partition heals. LWW compares timestamps:
+  If T2 > T1: stored value becomes 103 (Group A's +5 is silently lost)
+  If T1 > T2: stored value becomes 105 (Group B's +3 is silently lost)
+```
+
+Either way, one client's increment vanishes. To prevent this:
+
+- Set `member_count_quorum = ceil((N+1)/2)` so the minority side rejects all writes.
+- Accept the availability trade-off: a partition that splits the cluster evenly leaves at least one side unable to write.
+- For counters that absolutely must not lose updates and must remain available on both sides of a partition, a CRDT PN-Counter is required (not currently provided by Kamino).
 
 ## Error Handling Summary
 

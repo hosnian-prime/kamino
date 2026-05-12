@@ -6,6 +6,17 @@ Kamino provides **approximate distributed locks** for coordinating access to sha
 
 > **Important**: These locks are approximate and should only be used for non-critical coordination purposes (e.g., deduplication, rate limiting, cache stampede prevention). They are **not** suitable for mission-critical distributed synchronization where absolute mutual exclusion is required.
 
+## Lock API Safety
+
+Kamino exposes two lock variants. **Use `lock_with_timeout` by default.**
+
+| Variant | Auto-expire | Use case |
+|---------|-------------|----------|
+| `lock_with_timeout(key, lease, deadline)` | ✓ — lease expires after `lease` duration | **Recommended**. The lease is the safety net against caller crashes. |
+| `lock(key, deadline)` | ✗ — held forever until explicit unlock | Footgun. Only correct when you can guarantee orderly unlock (i.e., never). |
+
+The `lock` (no-timeout) variant exists for completeness but in practice almost always reflects a bug. If the holder crashes between `lock` and `unlock`, the lock remains held until the partition owner is restarted or the entry is manually deleted. Treat it as `unsafe`.
+
 ## Algorithm
 
 ### Lock Acquisition
@@ -86,29 +97,33 @@ async fn lock(&self, key: &str, deadline: Duration) -> Result<LockContext> {
 }
 ```
 
-## Lock with Timeout
+## The Two Lock Variants in Detail
 
-Two variants are provided:
+### `lock_with_timeout(key, lease, deadline)` — Recommended
 
-### `lock(key, deadline)`
-- Tries to acquire the lock
-- Retries every 10ms until `deadline` expires
-- The lock has no automatic expiry (held until explicitly unlocked)
+```
+acquire_loop:
+  attempt PUT(key, token) with NX and TTL=lease
+  on success → return LockContext { token, lease_expires_at }
+  on already-exists:
+    if Instant::now() >= deadline_at → return ErrLockNotAcquired
+    sleep 10ms and retry
+```
 
-### `lock_with_timeout(key, timeout, deadline)`
-- Same retry behavior as `lock`
-- The lock automatically expires after `timeout` duration
-- Acts as a safety net against lock holder crashes
+The lease is the safety net. If the holder crashes, the entry expires after `lease` and another caller can acquire. The holder can call `LockContext::lease()` to extend before expiry; if it forgets, the lock is recoverable.
 
 ```rust
-// Lock that auto-expires after 30 seconds
-// Give up trying after 5 seconds
+// Lease auto-expires after 30s. Give up acquisition after 5s.
 let lock = cache.lock_with_timeout(
     "resource:mutex",
-    Duration::from_secs(30),  // lock timeout (auto-expire)
+    Duration::from_secs(30),  // lease (auto-expiry)
     Duration::from_secs(5),   // acquisition deadline
 ).await?;
 ```
+
+### `lock(key, deadline)` — Footgun, Avoid
+
+Same acquisition loop but the PUT has no TTL. If the holder crashes, the lock entry remains until manual deletion or partition owner restart. There is no good reason to call this in application code; it is provided only as a primitive for the implementation of `lock_with_timeout` itself.
 
 ## Wire Protocol
 
@@ -145,13 +160,17 @@ DM.PLOCKLEASE <dmap> <key> <token> <milliseconds>
 - Lock holder can still unlock using the original token
 
 ### Network Partition
-- Lock operations route to the partition owner
-- If the partition owner is unreachable, the operation fails
-- With `member_count_quorum` set, minority partitions reject lock operations
+
+Lock operations route to the partition owner. Behavior depends on `member_count_quorum`:
+
+- `member_count_quorum >= majority`: minority partitions reject lock operations with `ErrClusterQuorum`. **Recommended** for any lock used to gate writes — both sides cannot believe they hold the lock.
+- `member_count_quorum = 1` (default): both partitions accept locks for keys whose primaries they each contain. After heal, LWW resolves — one side's lock entry survives, the other's is silently dropped, and both holders may have already entered their critical sections. **This violates mutual exclusion.**
+
+If a lock matters, set the quorum.
 
 ## Best Practices
 
-1. **Always use timeouts**: Use `lock_with_timeout` to prevent indefinite lock holding
+1. **Always use `lock_with_timeout`**: The no-lease `lock` variant has no safety net — a crashed holder permanently wedges the key. Treat `lock` as `unsafe`.
 2. **Keep critical sections short**: Minimize time between lock and unlock
 3. **Use lease extension for long operations**: Call `lease()` periodically for operations that may take longer than the initial timeout
 4. **Don't use for financial transactions**: These locks are approximate; use a proper consensus system (Raft, etc.) for critical mutual exclusion

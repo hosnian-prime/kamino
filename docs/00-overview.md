@@ -2,13 +2,13 @@
 
 ## Overview
 
-Kamino is a distributed, in-memory key/value store and cache library written in Rust. It is designed to be embedded directly into applications or run as a standalone server, providing a horizontally scalable caching layer with strong consistency guarantees under normal operation.
+Kamino is a distributed, in-memory key/value store and cache library written in Rust. It is designed to be embedded directly into applications or run as a standalone server, providing a horizontally scalable caching layer with single-primary write serialization per partition and Last-Write-Wins conflict resolution (see [Consistency Model](#consistency-model) for the full guarantee).
 
 ## Design Goals
 
-- **High Performance**: Zero-copy where possible, lock-free data paths, minimal allocations
+- **High Performance**: Concurrent reader paths via per-fragment RwLock, pre-allocated memory blocks, minimal allocations on the hot path
 - **Horizontal Scalability**: Automatic data partitioning and rebalancing as nodes join/leave
-- **Fault Tolerance**: Primary-backup replication with configurable quorum
+- **Optional Fault Tolerance**: Primary-backup replication with configurable quorum. **Note**: Defaults ship with `replica_count = 1` (no replicas) for development simplicity — production deployments must override these (see [Configuration](09-configuration.md#production-recommended-defaults))
 - **Operational Simplicity**: Zero external dependencies for coordination (no ZooKeeper, no etcd)
 - **Dual Mode**: Embeddable library or standalone server
 - **Rust Safety**: Leverage Rust's ownership model for memory safety without GC overhead
@@ -23,10 +23,13 @@ Kamino is built on three foundational subsystems:
 
 ## Consistency Model
 
-Kamino implements **PA/EC** per the PACELC theorem:
+Kamino is a **primary-routed, eventually consistent** distributed cache:
 
-- **Normal operation (no partition)**: Provides consistency via quorum reads/writes
-- **During network partition**: Prioritizes availability; conflict resolution uses **Last-Write-Wins (LWW)** with client-attached timestamps
+- **Single-primary serialization**: Each partition has exactly one primary owner; all writes for a partition are serialized through that primary.
+- **Replication**: Optional synchronous or asynchronous replication to backup owners (when `replica_count > 1`).
+- **Conflict resolution**: Last-Write-Wins (LWW) by server-assigned timestamp. Concurrent writes to different primaries (during a network partition) resolve via LWW after the partition heals — **the loser is silently dropped**.
+- **PACELC classification**: **PA/EL** — under Partition, prefers Availability; Else, prefers Latency (tunable via `replication_mode` and quorum settings). Strong consistency (linearizability) is **not** provided even with quorum settings, because LWW resolves conflicts non-deterministically with respect to client wall-clock order.
+- **Split-brain protection**: Set `member_count_quorum` to a majority value to prevent minority partitions from accepting writes.
 
 ## Architecture at a Glance
 

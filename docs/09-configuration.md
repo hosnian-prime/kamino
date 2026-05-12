@@ -284,3 +284,46 @@ let config = Config {
 | `num_eviction_workers` | 1 |
 | `lru_samples` | 5 |
 | `eviction_policy` | None |
+
+## Production-Recommended Defaults
+
+The shipped defaults prioritize developer ergonomics (single-node quickstart, no replication overhead). **These are not safe for production.** For any deployment that must survive a node crash without data loss, override the following:
+
+```toml
+[core]
+# Was: 1. Production: at least 2 (primary + 1 backup).
+replica_count = 2
+
+# Was: 1. Production: match replica_count for strong write durability,
+# or replica_count - 1 to tolerate one slow backup.
+write_quorum = 2
+
+# Was: 1. Production: majority of expected cluster size.
+# Example: N=3 → 2, N=5 → 3, N=7 → 4. Prevents minority-partition writes.
+member_count_quorum = 2   # for a 3-node cluster
+
+# Was: false. Recommended ON if cross-DC or replica drift is a concern.
+read_repair = true
+```
+
+### Sizing Quorums
+
+For a cluster of N nodes:
+
+| N | `replica_count` | `write_quorum` | `member_count_quorum` |
+|---|-----------------|----------------|------------------------|
+| 3 | 2 or 3          | 2              | 2                      |
+| 5 | 3               | 2 or 3         | 3                      |
+| 7 | 3               | 2 or 3         | 4                      |
+
+### What These Defaults Lose
+
+- **Latency**: Sync replication adds one network round-trip per write to the slowest backup in the quorum.
+- **Availability under partition**: With `member_count_quorum = majority`, the minority side stops serving writes.
+- **Memory**: Each additional replica multiplies cluster-wide memory usage by ~1× per replica (replica_count=2 → 2× total memory across the cluster).
+
+These are conscious trade-offs against the **silent data-loss** mode of the shipped defaults. Pick the trade-off you can defend in a post-incident review.
+
+### NTP Requirement
+
+LWW conflict resolution uses primaries' wall-clock timestamps. Run NTP on every node and alert if drift exceeds 50ms. Without this, cross-primary LWW under partition may resolve in favor of the wrong write. See [Replication](04-replication.md#failure-mode-cross-primary-clock-skew).
