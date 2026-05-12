@@ -1,0 +1,24 @@
+# Build
+/target/
+**/*.rs.bk
+
+# Cargo
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Claude Code
+.claude/settings.local.json
