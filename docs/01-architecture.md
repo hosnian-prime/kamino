@@ -60,6 +60,8 @@ KaminoNode
 
 There is **no Raft or Paxos consensus**. The coordinator is simply the oldest member in the cluster, determined by birthdate (join timestamp). When the coordinator leaves or fails, the second-oldest member automatically assumes the role.
 
+**Eventual coordinator convergence**: Because membership is eventually consistent via SWIM, two nodes may briefly consider themselves the coordinator during a membership transition. Routing tables carry a monotonic `signature` field; nodes accept the table with the higher signature and reject older versions. Coordinator tiebreaker is `(birthdate ASC, member_id ASC)` to ensure deterministic agreement when birthdates collide. See [Cluster Management](03-cluster-management.md#coordinator).
+
 **Coordinator responsibilities:**
 1. Build the routing table using consistent hashing
 2. Push the routing table to all cluster members

@@ -9,6 +9,10 @@ Kamino uses the **RESP (Redis Serialization Protocol)** for all communication - 
 - **Performance**: Efficient binary-safe encoding with minimal overhead
 - **Proven at scale**: Battle-tested protocol used by millions of Redis deployments
 
+### Protocol Version
+
+Kamino implements **RESP2** by default. Clients may upgrade to **RESP3** by sending `HELLO 3` immediately after `AUTH`; this enables RESP3 push frames for pub/sub delivery (cleaner separation from request/response). All command-level encoding remains RESP2-compatible.
+
 ## Server Configuration
 
 | Parameter | Default | Description |
@@ -20,6 +24,8 @@ Kamino uses the **RESP (Redis Serialization Protocol)** for all communication - 
 
 ## Authentication
 
+### Client Authentication
+
 Simple password-based authentication (equivalent to Redis `requirepass`):
 
 ```
@@ -27,7 +33,15 @@ Client: AUTH mypassword
 Server: +OK
 ```
 
-No TLS built-in. For encrypted transport, use a TLS proxy (e.g., stunnel, envoy) or wrap at the network layer.
+Configured via `auth.password` in the config file.
+
+### Inter-Node Authentication
+
+Server-to-server messages carry a separate `cluster_secret`. This prevents an arbitrary RESP client (which only has the client password) from issuing `INTERNAL.NODE.*` commands. The internal client attaches the cluster secret to every inter-node connection at handshake time.
+
+### Wire Security: No Built-in TLS
+
+There is no built-in TLS for either client or inter-node traffic. **Both the client AUTH password and the inter-node cluster_secret are sent in plaintext over the network.** For any deployment outside a trusted private network, terminate TLS at a proxy (stunnel, envoy, AWS NLB with TLS, Kubernetes service mesh with mTLS) and treat the Kamino port as accessible only from `127.0.0.1` of the proxy host.
 
 ## Command Set
 
@@ -35,18 +49,18 @@ No TLS built-in. For encrypted transport, use a TLS proxy (e.g., stunnel, envoy)
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `DM.PUT` | `DM.PUT dmap key value [EX s] [PX ms] [EXAT ts] [PXAT ts] [NX\|XX]` | Store a key-value pair |
+| `DM.PUT` | `DM.PUT dmap key value [EX s] [PX ms] [EXAT ts] [PXAT ts] [NX\|XX] [TS unix-nanos]` | Store a key-value pair (TS overrides server-assigned timestamp; see Put Options) |
 | `DM.GET` | `DM.GET dmap key` | Retrieve a value by key |
 | `DM.DEL` | `DM.DEL dmap key [key ...]` | Delete one or more keys |
 | `DM.EXPIRE` | `DM.EXPIRE dmap key seconds` | Set TTL in seconds |
 | `DM.PEXPIRE` | `DM.PEXPIRE dmap key milliseconds` | Set TTL in milliseconds |
-| `DM.INCR` | `DM.INCR dmap key delta` | Atomically increment integer value |
-| `DM.DECR` | `DM.DECR dmap key delta` | Atomically decrement integer value |
+| `DM.INCR` | `DM.INCR dmap key delta` | Increment integer value (serialized at partition primary; lost-update under partition — see [Replication](04-replication.md#incrdecr-lost-update-warning)) |
+| `DM.DECR` | `DM.DECR dmap key delta` | Decrement integer value (same caveat as DM.INCR) |
 | `DM.GETPUT` | `DM.GETPUT dmap key value` | Set value and return previous |
-| `DM.INCRBYFLOAT` | `DM.INCRBYFLOAT dmap key delta` | Atomically increment float value |
+| `DM.INCRBYFLOAT` | `DM.INCRBYFLOAT dmap key delta` | Increment float value (same caveat as DM.INCR) |
 | `DM.DESTROY` | `DM.DESTROY dmap` | Delete entire DMap |
-| `DM.SCAN` | `DM.SCAN partID dmap cursor [MATCH pat] [COUNT n]` | Cursor-based iteration |
-| `DM.LOCK` | `DM.LOCK dmap key deadline [timeout]` | Acquire distributed lock |
+| `DM.SCAN` | `DM.SCAN partID dmap cursor [MATCH pat] [COUNT n]` | Cursor-based iteration **scoped to a single partition**. Clients iterate the whole DMap by scanning each partition ID (0..partition_count). Cursors are opaque server-assigned tokens; a cursor returned by partition P is invalidated if partition P migrates between scan calls (server returns `ErrInvalidCursor` — restart the scan for that partition). |
+| `DM.LOCK` | `DM.LOCK dmap key deadline [timeout]` | Acquire distributed lock (the `timeout` form is the safe variant; see [Distributed Locking](10-distributed-locking.md#lock-api-safety)) |
 | `DM.UNLOCK` | `DM.UNLOCK dmap key token` | Release distributed lock |
 | `DM.LOCKLEASE` | `DM.LOCKLEASE dmap key token seconds` | Extend lock lease |
 | `DM.PLOCKLEASE` | `DM.PLOCKLEASE dmap key token milliseconds` | Extend lock lease (ms) |
@@ -61,6 +75,7 @@ No TLS built-in. For encrypted transport, use a TLS proxy (e.g., stunnel, envoy)
 | `PXAT unix-milliseconds` | Set absolute expiry (Unix timestamp ms) |
 | `NX` | Only set if key does **not** exist |
 | `XX` | Only set if key **already** exists |
+| `TS unix-nanos` | Override the server-assigned LWW timestamp. Use with care — see [LWW](04-replication.md#timestamp-source) |
 
 ### Pub/Sub Commands
 
@@ -81,6 +96,7 @@ No TLS built-in. For encrypted transport, use a TLS proxy (e.g., stunnel, envoy)
 |---------|--------|-------------|
 | `CLUSTER.ROUTINGTABLE` | `CLUSTER.ROUTINGTABLE` | Get current routing table |
 | `CLUSTER.MEMBERS` | `CLUSTER.MEMBERS` | List cluster members |
+| `CLUSTER.READY` | `CLUSTER.READY` | Returns `+OK` only if this node has: (1) joined the SWIM cluster, (2) received a routing table with `signature > 0`, (3) `member_count >= member_count_quorum`. Otherwise returns an error. Suitable for Kubernetes readiness probes. |
 
 ### Internal Commands (Server-to-Server)
 

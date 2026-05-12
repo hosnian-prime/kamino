@@ -112,18 +112,35 @@ pub trait DiscoveryPlugin: Send + Sync {
 
 ## Coordinator
 
-The **coordinator** is the oldest node in the cluster, determined by birthdate (monotonic timestamp assigned at join time).
+The **coordinator** is the oldest node in the cluster. The member list is sorted by `(birthdate ASC, id ASC)`; the first member is the coordinator.
 
-### Election
+### Tiebreaker
 
-There is no election protocol. The member list is sorted by birthdate, and the first member is the coordinator. All nodes independently agree on this ordering because they share the same membership view (eventually consistent via SWIM).
+Two nodes can be assigned identical birthdates (clock resolution, simultaneous join). The deterministic tiebreaker is `Member.id` (u64, unique per node — generated from a random seed at boot, persisted in process memory):
 
 ```rust
 fn coordinator(&self) -> &Member {
-    // Members sorted by birthdate (ascending)
+    // Members sorted by (birthdate, id), ascending
     &self.members[0]
 }
+
+fn sort_members(members: &mut Vec<Member>) {
+    members.sort_by(|a, b| (a.birthdate, a.id).cmp(&(b.birthdate, b.id)));
+}
 ```
+
+### Election (Eventually Consistent)
+
+There is no election protocol. Every node sorts its local member list and picks index 0. All nodes converge on the same answer **eventually**, but during SWIM convergence (e.g., immediately after a coordinator failure) different nodes may briefly disagree.
+
+**During disagreement, two nodes may both attempt to push routing tables.** The resolution mechanism is the `RoutingTable.signature` field:
+
+1. The coordinator increments `signature` on every topology change.
+2. Receivers reject any routing table whose signature is ≤ their current signature.
+3. The "real" coordinator's signature pulls ahead because it sees the topology change first (after SWIM converges, the wrong coordinator stops generating new tables — its view is stale, so its signature stops advancing).
+4. After SWIM convergence (typically within a few probe intervals), only one node has the correct, latest member set and therefore produces the highest-signature table.
+
+This is **not Paxos/Raft** and provides no liveness guarantee during sustained network instability — but for transient SWIM convergence (sub-second), the signature mechanism is sufficient.
 
 ### Coordinator Responsibilities
 
@@ -144,7 +161,8 @@ When the coordinator fails:
 
 ```rust
 pub struct Member {
-    /// Unique identifier
+    /// Unique identifier, used as the tiebreaker when birthdates collide.
+    /// Generated at boot from a random seed.
     pub id: u64,
     /// Display name
     pub name: String,

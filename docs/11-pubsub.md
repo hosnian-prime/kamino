@@ -175,18 +175,31 @@ loop {
 When `enable_cluster_events_channel = true`, Kamino publishes internal cluster events to the `cluster.events` channel:
 
 ```rust
-// Subscribe to cluster events
 let sub = pubsub.subscribe(&["cluster.events"]).await?;
-
-// Receive events like:
-// { "type": "node-join", "member": "node-3", "addr": "10.0.1.3:3320" }
-// { "type": "node-left", "member": "node-2", "addr": "10.0.1.2:3320" }
+// Events like:
+// { "type": "node-join",          "member": "node-3", "addr": "10.0.1.3:3320" }
+// { "type": "node-left",          "member": "node-2", "addr": "10.0.1.2:3320" }
 // { "type": "fragment-migration", "partition": 42, "from": "node-1", "to": "node-3" }
 ```
 
+### Reliability Caveat
+
+Cluster events are delivered over the same pub/sub channel as application messages, which means **at-most-once delivery**: an event is lost if the subscriber is disconnected, slow to drain, or temporarily partitioned at the moment of publish.
+
+For consumers that need to track cluster state precisely (operational dashboards, control-plane integrations), **do not rely on the event stream alone**. Pair it with periodic reconciliation:
+
+```rust
+// Drain events; on every tick (e.g., 30s) also poll for ground truth.
+let routing = client.routing_table().await?;
+let members = client.members().await?;
+// Diff the snapshot against what events implied; correct any drift.
+```
+
+The event stream is the fast path for cache-friendly notifications. The poll is the slow path that guarantees eventual correctness.
+
 ## Delivery Guarantees
 
-- **At-most-once**: Messages are delivered at most once. If a subscriber is disconnected at the time of publish, the message is lost.
+- **At-most-once**: Messages are delivered at most once. If a subscriber is disconnected, slow to drain its buffer, or partitioned at the moment of publish, the message is **silently lost** — no error is surfaced to publisher or subscriber. Subscribers that depend on receiving every message must pair the subscription with a reconciliation mechanism (see [Cluster Event Channel](#cluster-event-channel) for an example).
 - **No persistence**: Messages are not stored. There is no message history or replay.
 - **No ordering guarantee across nodes**: Messages published on different nodes may arrive in different orders.
 - **Ordering within a connection**: Messages from the same publisher to the same channel arrive in order.

@@ -28,6 +28,11 @@ pub trait Client: Send + Sync {
     /// Force refresh the cached routing table metadata
     async fn refresh_metadata(&self) -> Result<()>;
 
+    /// Total number of hash-ring partitions (from the cluster config).
+    /// Stable for the lifetime of the cluster; used by `DMap::scan` to iterate
+    /// all partitions of a DMap.
+    fn partition_count(&self) -> u32;
+
     /// Gracefully close the client
     async fn close(&self) -> Result<()>;
 }
@@ -49,34 +54,51 @@ pub trait DMap: Send + Sync {
     /// Delete one or more keys, returns count of deleted keys
     async fn delete(&self, keys: &[&str]) -> Result<usize>;
 
-    /// Atomically increment an integer value
+    /// Increment an integer value, serialized at the partition primary.
+    /// NOT atomic across the cluster under partition — see [Replication](04-replication.md#incrdecr-lost-update-warning).
     async fn incr(&self, key: &str, delta: i64) -> Result<i64>;
 
-    /// Atomically decrement an integer value
+    /// Decrement an integer value, serialized at the partition primary.
+    /// Same partition caveat as `incr`.
     async fn decr(&self, key: &str, delta: i64) -> Result<i64>;
 
     /// Set value and return previous value
     async fn get_put(&self, key: &str, value: &[u8]) -> Result<Option<GetResponse>>;
 
-    /// Atomically increment a float value
+    /// Increment a float value, serialized at the partition primary.
+    /// Same partition caveat as `incr`.
     async fn incr_by_float(&self, key: &str, delta: f64) -> Result<f64>;
 
     /// Set or update TTL for a key
     async fn expire(&self, key: &str, duration: Duration) -> Result<()>;
 
-    /// Acquire a distributed lock on a key
+    /// Acquire a distributed lock on a key.
+    ///
+    /// **⚠ SAFETY**: This variant holds the lock with NO automatic expiry. If the caller
+    /// crashes or loses connection, the lock remains held until the partition owner
+    /// restarts or someone manually deletes the entry. **Prefer `lock_with_timeout` for
+    /// any lock that may be released by something other than orderly shutdown.**
     async fn lock(&self, key: &str, deadline: Duration) -> Result<LockContext>;
 
-    /// Acquire a distributed lock with timeout
+    /// Acquire a distributed lock that auto-expires after `lease`. Recommended variant.
+    ///
+    /// `deadline` is how long to keep retrying acquisition; `lease` is how long the lock
+    /// stays held once acquired. The lock holder can call `LockContext::lease` to extend.
     async fn lock_with_timeout(
         &self,
         key: &str,
-        timeout: Duration,
+        lease: Duration,
         deadline: Duration,
     ) -> Result<LockContext>;
 
-    /// Cursor-based key iteration
-    async fn scan(&self, options: ScanOptions) -> Result<Box<dyn Iterator>>;
+    /// Cursor-based iteration over a single partition.
+    /// Clients iterate the whole DMap by calling scan for each partition ID (0..partition_count).
+    /// See `Client::partition_count()`.
+    async fn scan(
+        &self,
+        partition_id: u32,
+        options: ScanOptions,
+    ) -> Result<Box<dyn ScanCursor>>;
 
     /// Delete the entire DMap across all partitions
     async fn destroy(&self) -> Result<()>;
@@ -90,18 +112,22 @@ pub trait DMap: Send + Sync {
 
 ```rust
 pub struct PutOptions {
-    /// Set expiry in seconds
+    /// Set expiry in seconds.
     pub ex: Option<u64>,
-    /// Set expiry in milliseconds
+    /// Set expiry in milliseconds.
     pub px: Option<u64>,
-    /// Set absolute expiry (Unix timestamp seconds)
+    /// Set absolute expiry (Unix timestamp seconds).
     pub exat: Option<u64>,
-    /// Set absolute expiry (Unix timestamp milliseconds)
+    /// Set absolute expiry (Unix timestamp milliseconds).
     pub pxat: Option<u64>,
-    /// Only set if key does NOT exist
+    /// Only set if key does NOT exist.
     pub nx: bool,
-    /// Only set if key ALREADY exists
+    /// Only set if key ALREADY exists.
     pub xx: bool,
+    /// Override the server-assigned LWW timestamp (Unix nanoseconds).
+    /// Leave as `None` to let the partition primary stamp the entry on acceptance.
+    /// Provide a value only for replication tools, replay, or external HLC integration.
+    pub timestamp: Option<i64>,
 }
 ```
 
@@ -152,18 +178,20 @@ impl LockContext {
 }
 ```
 
-## Iterator
+## Scan Cursor
 
 ```rust
-pub trait Iterator: Send {
-    /// Advance to the next key
-    fn next(&mut self) -> bool;
+#[async_trait]
+pub trait ScanCursor: Send {
+    /// Advance and return the next entry, or `None` when the partition is exhausted.
+    ///
+    /// Returns `Err(InvalidCursor)` if the partition migrated to a different owner
+    /// between calls. On `InvalidCursor`, restart the scan for that partition from
+    /// cursor 0; the data is not lost, only the iteration state.
+    async fn next(&mut self) -> Result<Option<(String, Vec<u8>)>>;
 
-    /// Get the current key
-    fn key(&self) -> &str;
-
-    /// Close the iterator and release resources
-    fn close(&mut self);
+    /// Release server-side cursor state.
+    async fn close(&mut self) -> Result<()>;
 }
 ```
 
@@ -171,14 +199,27 @@ pub trait Iterator: Send {
 
 ```rust
 pub struct ScanOptions {
-    /// Approximate number of keys per batch
+    /// Approximate number of keys per server round-trip.
     pub count: Option<usize>,
-    /// Glob pattern to match keys
+    /// Glob pattern (e.g., `user:*`) matched against keys.
     pub match_pattern: Option<String>,
 }
 ```
 
-**Important**: Scan operates per-partition. The client must iterate through all `partition_count` partitions to scan the entire DMap.
+### Iterating the Whole DMap
+
+```rust
+let partition_count = client.partition_count();
+for part_id in 0..partition_count {
+    let mut cursor = dmap.scan(part_id, ScanOptions::default()).await?;
+    while let Some((key, value)) = cursor.next().await? {
+        // process (key, value)
+    }
+    cursor.close().await?;
+}
+```
+
+Scan is intentionally partition-scoped. Iterating partitions in parallel is safe but increases server load proportionally; for admin-grade full scans, bound the parallelism (e.g., 4–8 concurrent partitions).
 
 ## Pipeline
 

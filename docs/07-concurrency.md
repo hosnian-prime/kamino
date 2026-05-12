@@ -24,7 +24,7 @@ Level 3: Key-level
 
 The routing table is protected by an `RwLock`:
 
-- **Reads** (majority of operations): Concurrent, lock-free among readers. Every DMap operation reads the routing table to determine the partition owner.
+- **Reads** (majority of operations): Multiple concurrent readers allowed via `RwLock` shared mode (not lock-free — readers and a pending writer are coordinated by the lock implementation). Every DMap operation reads the routing table to determine the partition owner.
 - **Writes** (rare, topology changes only): Exclusive lock. Only the coordinator thread updates the routing table.
 
 Additionally, a dedicated `update_routing_mutex` serializes routing table updates to prevent concurrent recalculations:
@@ -68,6 +68,8 @@ pub struct Fragment {
 
 This allows concurrent reads on the same DMap partition while serializing writes.
 
+**Async semantics**: The fragment lock is `tokio::sync::RwLock` (async). The storage engine trait itself is `async` (see [Storage Engine](05-storage-engine.md#storage-engine-trait)), so all storage operations yield cooperatively. CPU-bound work (e.g., serialization of large entries) is dispatched to a blocking pool via `spawn_blocking` when measured to exceed a few hundred microseconds.
+
 ## Key-Level Locking (Named Locks)
 
 For atomic operations (`INCR`, `DECR`, `GETPUT`, `INCRBYFLOAT`), a fine-grained named lock system prevents races on individual keys:
@@ -96,7 +98,7 @@ impl Locker {
 }
 ```
 
-**Automatic cleanup**: When a lock guard is dropped and the waiter count reaches zero, the lock entry is removed from the map. This prevents unbounded memory growth.
+**Automatic cleanup**: Removal of a `LockEntry` from the map happens under the same map mutex that any new waiter must acquire for lookup. When the last guard drops and the waiter count reaches zero, the cleanup path locks the map and removes the entry; a concurrent lookup either runs to completion before the lock is acquired (and obtains a valid `Arc<LockEntry>`) or runs after removal (and inserts a fresh entry). This prevents both unbounded growth and the use-after-free of removed entries.
 
 ### Usage in Atomic Operations
 

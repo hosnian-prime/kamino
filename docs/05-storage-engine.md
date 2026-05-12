@@ -86,7 +86,7 @@ Each entry is serialized as a compact binary structure:
 | `key_length` | 1 byte | u8 | Key length (max 255 bytes) |
 | `key` | variable | [u8] | Raw key bytes |
 | `ttl` | 8 bytes | i64 | Time-to-live in nanoseconds (0 = no expiry) |
-| `timestamp` | 8 bytes | i64 | Entry creation/update timestamp (for LWW) |
+| `timestamp` | 8 bytes | i64 | Entry creation/update timestamp (for LWW). **Assigned by the partition primary at write acceptance** from the local monotonic clock anchored to wall-time. May be overridden by the client via `PutOptions.timestamp` for replay or external HLC integration. |
 | `last_access` | 8 bytes | i64 | Last access timestamp (for LRU eviction) |
 | `value_length` | 4 bytes | u32 | Value length |
 | `value` | variable | [u8] | Raw value bytes |
@@ -168,39 +168,42 @@ Process:
 ## Storage Engine Trait
 
 ```rust
+#[async_trait]
 pub trait StorageEngine: Send + Sync {
-    /// Store an entry
-    fn put(&mut self, hkey: u64, entry: &Entry) -> Result<()>;
+    /// Store an entry.
+    async fn put(&mut self, hkey: u64, entry: &Entry) -> Result<()>;
 
-    /// Retrieve an entry by hash key
-    fn get(&self, hkey: u64) -> Result<Entry>;
+    /// Retrieve an entry by hash key.
+    async fn get(&self, hkey: u64) -> Result<Entry>;
 
-    /// Delete an entry
-    fn delete(&mut self, hkey: u64) -> Result<bool>;
+    /// Delete an entry. Returns true if a live entry was deleted.
+    async fn delete(&mut self, hkey: u64) -> Result<bool>;
 
-    /// Scan all entries
-    fn scan<F>(&self, f: F) -> Result<()>
-    where F: FnMut(u64, &Entry) -> bool;
+    /// Scan all entries. The callback returns `false` to stop iteration.
+    async fn scan<F>(&self, f: F) -> Result<()>
+    where F: FnMut(u64, &Entry) -> bool + Send;
 
-    /// Scan entries matching a regex pattern
-    fn scan_regex_match<F>(&self, pattern: &str, f: F) -> Result<()>
-    where F: FnMut(u64, &Entry) -> bool;
+    /// Scan entries whose keys match a regex pattern.
+    async fn scan_regex_match<F>(&self, pattern: &str, f: F) -> Result<()>
+    where F: FnMut(u64, &Entry) -> bool + Send;
 
-    /// Number of stored entries
+    /// Number of stored entries.
     fn len(&self) -> usize;
 
-    /// Total bytes in use
+    /// Total bytes in use.
     fn inuse(&self) -> usize;
 
-    /// Export all data for migration
-    fn export(&self) -> Result<Vec<u8>>;
+    /// Export all data for migration.
+    async fn export(&self) -> Result<Vec<u8>>;
 
-    /// Import data from migration
-    fn import(&mut self, data: &[u8]) -> Result<()>;
+    /// Import data from migration (with LWW merge if entries collide).
+    async fn import(&mut self, data: &[u8]) -> Result<()>;
 }
 ```
 
-Custom storage engines (e.g., disk-backed, LMDB, RocksDB) can be implemented by providing this trait.
+Custom storage engines can be implemented by providing this trait. The default `RamBlock` is in-memory and trivially async (all futures complete in the same poll). Disk-backed engines (LMDB, RocksDB, on-disk B-trees) use real async I/O via their respective async-capable bindings or `spawn_blocking` internally.
+
+The `len()` and `inuse()` accessors remain synchronous because they are O(1) atomic reads that must be available to size-based eviction without yielding.
 
 ## Per-DMap Storage Configuration
 
@@ -216,3 +219,31 @@ lru_samples = 10
 eviction_policy = "LRU"
 storage_engine = "ramblock"
 ```
+
+## Limitations
+
+### Key Size: 255 bytes
+
+The entry header's `key_length` field is `u8`, so keys are limited to **255 bytes**. This is significantly more restrictive than Redis (512 MB). It is suitable for typical cache keys (user IDs, session tokens, short composite keys) but **not** for long URLs, full file paths, or large composite keys.
+
+If your workload requires longer keys, hash the application-level key client-side (e.g., to a 32-byte SHA-256 hex) and store the original key inside the value if you need to recover it.
+
+### Value Size and Table Sizing
+
+A value is bounded by `u32` length (~4 GiB), but the practical limit is the `table_size` configuration (default: 1 MiB):
+
+- If a value plus its 29-byte overhead fits in the current `ReadWrite` table → appended directly.
+- If it does not fit → the current table is sealed `ReadOnly` and a fresh table is allocated to hold the new entry.
+- If a single value exceeds `table_size`, the storage engine allocates a one-shot table sized to fit the value plus overhead. This is supported but inefficient — keep `table_size` ≥ your P99 value size.
+
+### Max Key/Value Cardinality per DMap
+
+`max_keys` and `max_inuse` are soft limits enforced by LRU eviction. They are **not** hard rejections — under bursty writes the limits may be transiently exceeded before eviction catches up.
+
+### No Persistence
+
+RamBlock is purely in-memory. There is no WAL, no snapshot to disk, no recovery on restart. A node restart loses all data on that node. Cluster-level durability comes from `replica_count` only.
+
+### Compaction Pause
+
+During compaction of a ReadOnly table, the fragment write lock is **not** held — reads continue from the old table while the new compacted table is built. The atomic swap at the end is short (single pointer update). However, the compaction itself consumes CPU and memory proportional to table size; tune `trigger_compaction_interval` for your workload.
