@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kamino_client::Client;
+use kamino_cluster::MemberProvider;
 use kamino_protocol::{Command, Frame};
 
 use crate::handlers::{self, Response};
@@ -15,13 +16,30 @@ use crate::metrics::ServerMetrics;
 use crate::state::ConnState;
 
 /// Static server-side context shared by all connections.
-#[derive(Debug)]
 pub(crate) struct ServerContext {
     pub(crate) client: Arc<dyn Client>,
     pub(crate) password: String,
     pub(crate) metrics: Arc<ServerMetrics>,
     pub(crate) version: &'static str,
     pub(crate) id: u64,
+    /// Source for `CLUSTER.MEMBERS`. `None` when running standalone-without-
+    /// cluster (Phase 2 compatibility); in that case the handler returns an
+    /// empty array per `docs/06-network-protocol.md`.
+    pub(crate) member_provider: Option<Arc<dyn MemberProvider>>,
+}
+
+impl std::fmt::Debug for ServerContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `client` and `metrics` are `dyn` / `Arc` and have no useful Debug
+        // payload at this level; skipping them keeps the formatter cheap and
+        // log-safe.
+        f.debug_struct("ServerContext")
+            .field("password_set", &!self.password.is_empty())
+            .field("version", &self.version)
+            .field("id", &self.id)
+            .field("member_provider", &self.member_provider.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 const NOAUTH: &str = "NOAUTH Authentication required";
@@ -85,6 +103,8 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
             cursor,
             options,
         } => handlers::dm_scan(&ctx.client, &dmap, partition_id, cursor, options).await,
+
+        Command::ClusterMembers => handlers::cluster_members(ctx.member_provider.as_ref()),
     }
 }
 
@@ -114,6 +134,7 @@ mod tests {
             metrics: Arc::new(ServerMetrics::new()),
             version: "0.0.0",
             id: 1,
+            member_provider: None,
         }
     }
 
@@ -256,6 +277,17 @@ mod tests {
         let mut st = ConnState::new(false);
         let resp = dispatch(&ctx, &mut st, Command::Stats).await;
         assert!(matches!(resp.frame, Frame::Array(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn cluster_members_empty_without_provider() {
+        let ctx = ctx_no_auth();
+        let mut st = ConnState::new(false);
+        let resp = dispatch(&ctx, &mut st, Command::ClusterMembers).await;
+        let Frame::Array(Some(items)) = resp.frame else {
+            panic!("expected array");
+        };
+        assert!(items.is_empty(), "no provider → empty array");
     }
 
     #[test]

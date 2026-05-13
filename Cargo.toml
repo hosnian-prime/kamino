@@ -85,16 +85,20 @@ roaring = "0.10"
 regex = "1.10"
 
 # Logging detail / IDs
-rand = "0.8"
+rand = { version = "0.8", features = ["small_rng"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Cluster / SWIM
+socket2 = { version = "0.5", features = ["all"] }
 
 # Dev / test
 proptest = "1.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 assert_matches = "1.5"
 loom = "0.7"
+turmoil = "0.6"
 
 [profile.release]
 opt-level = 3

@@ -79,6 +79,10 @@ pub enum Command {
         cursor: u64,
         options: ScanCommandOptions,
     },
+
+    // --- Cluster (Phase 3+) ---
+    /// `CLUSTER.MEMBERS` — returns the local view of cluster members.
+    ClusterMembers,
 }
 
 /// Optional flags for `DM.PUT`.
@@ -170,6 +174,7 @@ impl Command {
             b"DM.INCRBYFLOAT" => parse_dm_incrbyfloat(args),
             b"DM.DESTROY" => parse_dm_destroy(args),
             b"DM.SCAN" => parse_dm_scan(args),
+            b"CLUSTER.MEMBERS" => parse_cluster_members(&args),
             _ => Err(CommandError::UnknownCommand(
                 String::from_utf8_lossy(verb_lower).into_owned(),
             )),
@@ -285,6 +290,7 @@ impl Command {
                 }
                 v
             }
+            Self::ClusterMembers => vec![bulk("CLUSTER.MEMBERS")],
         };
         Frame::Array(Some(parts))
     }
@@ -534,6 +540,11 @@ fn parse_quit(args: &[Bytes]) -> Result<Command, CommandError> {
 fn parse_stats(args: &[Bytes]) -> Result<Command, CommandError> {
     require_exact(args, "STATS", 0)?;
     Ok(Command::Stats)
+}
+
+fn parse_cluster_members(args: &[Bytes]) -> Result<Command, CommandError> {
+    require_exact(args, "CLUSTER.MEMBERS", 0)?;
+    Ok(Command::ClusterMembers)
 }
 
 fn parse_dm_put(args: Vec<Bytes>) -> Result<Command, CommandError> {

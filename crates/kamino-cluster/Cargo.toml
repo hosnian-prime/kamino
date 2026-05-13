@@ -17,6 +17,10 @@ discovery-static = []
 discovery-dns = []
 discovery-kubernetes = []
 discovery-consul = []
+# In-memory `MockTransport` for deterministic SWIM tests. Enabled by integration
+# tests inside this crate; downstream consumers may opt-in for their own
+# simulations.
+mock-transport = []
 
 [dependencies]
 kamino-core = { workspace = true }
@@ -24,6 +28,7 @@ kamino-storage = { workspace = true }
 kamino-protocol = { workspace = true }
 kamino-observability = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
@@ -32,3 +37,15 @@ serde = { workspace = true }
 rmp-serde = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync", "test-util"] }
+tokio-util = { workspace = true, features = ["rt"] }
+turmoil = { workspace = true }
+proptest = { workspace = true }
+assert_matches = { workspace = true }
+tracing = { workspace = true }
+# Self-reference enables the `mock-transport` feature for integration tests so
+# they can use the in-memory `MockTransport`. Documented Cargo pattern; works
+# on stable. An explicit version satisfies `cargo-deny`'s wildcard ban.
+kamino-cluster = { path = ".", version = "0.0.0", features = ["mock-transport"] }
