@@ -15,42 +15,31 @@
 //! the merge so flipping the ignore-flag is the only change required at
 //! integration time.
 
-// Multi-node tests deliberately hold a `std::sync::MutexGuard` across `.await`
-// points to serialise themselves against each other (see `lock_multi_node`).
-// Each test runs on its own OS thread with its own current-thread tokio
-// runtime, so there's no other task that could acquire the lock, no
-// cancellation point, and no deadlock risk from the std guard.
-#![allow(clippy::field_reassign_with_default, clippy::await_holding_lock)]
+#![allow(clippy::field_reassign_with_default)]
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
+use kamino_cluster::transport::MockHub;
 use kamino_cluster::{Cluster, ClusterDeps, StaticDiscovery, Transport as _, UdpTransport};
 use kamino_core::clock::SystemClock;
 use kamino_core::config::Config;
 use kamino_core::ids::MemberId;
 use kamino_core::member::Member;
 
-/// Multi-node tests share a single process-wide *blocking* mutex so they never
-/// run concurrently. `cargo test` runs each `#[tokio::test]` on its own OS
-/// thread with a fresh tokio runtime, so a `tokio::sync::Mutex` wouldn't
-/// serialise across tests; a plain `std::sync::Mutex` works because every
-/// test thread sees the same lock. 7 turmoil tests × 5 nodes each = 35 SWIM
-/// probe loops fighting for the same scheduler caused intermittent timeouts
-/// on macOS runners under `--no-default-features`. Single-node tests stay
-/// parallel.
-fn lock_multi_node() -> MutexGuard<'static, ()> {
-    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(()))
-        .lock()
-        // Poisoning is irrelevant for a counter-of-zero mutex.
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Hand out distinct `127.0.0.1:N` "addresses" to mock transports so multiple
+/// clusters in the same test can be told apart by the hub.
+fn next_mock_port() -> u16 {
+    static SEQ: AtomicU16 = AtomicU16::new(40_000);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Bootstrap one node and return both the running cluster and the address
-/// it advertises for SWIM probes. `name` is purely cosmetic for logs.
+/// Bootstrap one node over a real localhost UDP socket. Used by the single-
+/// node runtime-wiring tests where exercising the actual `UdpTransport` is
+/// the point.
 async fn bootstrap_node(
     name: &str,
     birthdate: u64,
@@ -70,25 +59,63 @@ async fn bootstrap_node(
         discovery_addr,
         birthdate,
     );
+    let cluster = Cluster::bootstrap(deps_for(name, transport, discovery, local))
+        .await
+        .expect("bootstrap");
+    (cluster, discovery_addr)
+}
+
+/// Bootstrap one node over an in-memory [`MockTransport`] sharing the given
+/// hub. Used by the multi-node acceptance tests: routing is deterministic,
+/// no kernel buffers, no UDP packet drops under load, no GitHub-runner
+/// scheduler flake.
+async fn bootstrap_mock_node(
+    hub: &MockHub,
+    name: &str,
+    birthdate: u64,
+    peers: Vec<SocketAddr>,
+) -> (Arc<Cluster>, SocketAddr) {
+    let discovery_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), next_mock_port());
+    let transport = Arc::new(hub.endpoint(discovery_addr));
+    let discovery = Arc::new(StaticDiscovery::from_addrs(peers));
+    let local = Member::new(
+        MemberId::new_random(),
+        name,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3320),
+        discovery_addr,
+        birthdate,
+    );
+    let cluster = Cluster::bootstrap(deps_for(name, transport, discovery, local))
+        .await
+        .expect("bootstrap");
+    (cluster, discovery_addr)
+}
+
+fn deps_for(
+    _name: &str,
+    transport: Arc<dyn kamino_cluster::Transport>,
+    discovery: Arc<StaticDiscovery>,
+    local: Member,
+) -> ClusterDeps {
     let mut config = Config::default();
     config.discovery.peers = Vec::new();
     config.discovery.max_join_attempts = 2;
     config.discovery.join_retry_interval = Duration::from_millis(20);
     config.discovery.bootstrap_timeout = Duration::from_millis(250);
     config.discovery.leave_timeout = Duration::from_millis(50);
-    // Tight probe interval keeps the convergence tests fast.
+    // Tight probe interval keeps the convergence tests fast. With
+    // `MockTransport` the runtime cost of a probe round is dominated by
+    // tokio's tick precision (~1-5ms), so 100ms is plenty of headroom.
     config.swim.probe_interval = Duration::from_millis(100);
     config.swim.probe_timeout = Duration::from_millis(50);
     config.swim.suspicion_multiplier = 3;
-    let deps = ClusterDeps {
+    ClusterDeps {
         config,
         transport,
         discovery,
         clock: Arc::new(SystemClock),
         local,
-    };
-    let cluster = Cluster::bootstrap(deps).await.expect("bootstrap");
-    (cluster, discovery_addr)
+    }
 }
 
 #[tokio::test]
@@ -147,21 +174,19 @@ async fn assemble_only_path_is_independent_of_loops() {
 }
 
 // ---------------------------------------------------------------------------
-// The tests below require the probe + receive loops to actually move bytes
-// on the UDP socket. They are written against the frozen `Cluster` API so
-// they continue to compile while Agent A's loop bodies are stubs, but they
-// are `#[ignore]`d until merge so CI stays green.
+// Multi-node acceptance tests. All packet routing goes through a process-
+// local `MockHub` — no UDP sockets, no kernel buffers, no GitHub-runner
+// scheduler flakes. The probe loops still drive on real tokio time, so the
+// 3 * probe_interval (300ms) bound from SWIM holds.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn three_node_cluster_converges_within_three_probe_intervals() {
-    let _gate = lock_multi_node();
-    let (a, addr_a) = bootstrap_node("a", 100, Vec::new()).await;
-    let (b, addr_b) = bootstrap_node("b", 200, vec![addr_a]).await;
-    let (c, _addr_c) = bootstrap_node("c", 300, vec![addr_a, addr_b]).await;
+    let hub = MockHub::new();
+    let (a, addr_a) = bootstrap_mock_node(&hub, "a", 100, Vec::new()).await;
+    let (b, addr_b) = bootstrap_mock_node(&hub, "b", 200, vec![addr_a]).await;
+    let (c, _addr_c) = bootstrap_mock_node(&hub, "c", 300, vec![addr_a, addr_b]).await;
 
-    // probe_interval = 100ms, so three intervals = 300ms; allow generous
-    // slack to absorb parallel-test scheduler pressure on CI runners.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
     loop {
         let a_ids: HashSet<u64> = a.snapshot_members().iter().map(|m| m.id.as_u64()).collect();
@@ -183,27 +208,41 @@ async fn three_node_cluster_converges_within_three_probe_intervals() {
 
 #[tokio::test]
 async fn five_node_cluster_detects_death_within_suspicion_window() {
-    let _gate = lock_multi_node();
+    let hub = MockHub::new();
     let mut nodes: Vec<Arc<Cluster>> = Vec::new();
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for i in 0..5_u64 {
-        let (n, addr) = bootstrap_node(&format!("n{i}"), 100 + i, addrs.clone()).await;
+        let (n, addr) = bootstrap_mock_node(&hub, &format!("n{i}"), 100 + i, addrs.clone()).await;
         addrs.push(addr);
         nodes.push(n);
     }
-    // Leave one node and verify the remaining four observe the shrinkage.
-    // The graceful Leave broadcast on `shutdown` should land at every
-    // survivor; if any packet drops, SWIM suspicion
-    // (suspicion_multiplier * probe_interval = 3 * 100ms = 300ms) takes over.
-    let leaving = nodes.pop().unwrap();
-    let _ = leaving.shutdown().await;
+    // First wait for the cluster to fully converge to 5 members — only then
+    // does removing one node have a defined "before / after" against which
+    // we can measure the suspicion window. Without this gate, the leaving
+    // node's Leave gossip can race the cluster's own discovery and be
+    // ignored as an event for an unknown member.
+    let converge = tokio::time::Instant::now() + Duration::from_millis(3000);
+    while nodes.iter().any(|n| n.snapshot_members().len() != 5) {
+        assert!(
+            tokio::time::Instant::now() < converge,
+            "pre-death convergence failed; sizes = {:?}",
+            nodes
+                .iter()
+                .map(|n| n.snapshot_members().len())
+                .collect::<Vec<_>>(),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
-    // 10s deadline is generous for two reasons: (1) it's the worst observed
-    // duration on a fully-loaded macOS GitHub runner under
-    // `--no-default-features`, and (2) the test asserts correctness — that
-    // the cluster shrinks — not tight timing; Phase 5's Jepsen suite
-    // verifies the tight bound under controlled conditions.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(10_000);
+    // Drop one node. The graceful Leave broadcast on `shutdown` lands at
+    // every survivor through the mock hub; partition the leaving address
+    // so any belated probe sees the same UDP-style silent-drop behaviour.
+    let leaving = nodes.pop().unwrap();
+    let leaving_addr = *addrs.last().unwrap();
+    let _ = leaving.shutdown().await;
+    hub.partition(leaving_addr);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
     loop {
         let ok = nodes.iter().all(|n| n.snapshot_members().len() == 4);
         if ok {
@@ -226,11 +265,11 @@ async fn five_node_cluster_detects_death_within_suspicion_window() {
 
 #[tokio::test]
 async fn five_node_cluster_agrees_on_coordinator() {
-    let _gate = lock_multi_node();
+    let hub = MockHub::new();
     let mut nodes: Vec<Arc<Cluster>> = Vec::new();
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for i in 0..5_u64 {
-        let (n, addr) = bootstrap_node(&format!("n{i}"), 100 + i, addrs.clone()).await;
+        let (n, addr) = bootstrap_mock_node(&hub, &format!("n{i}"), 100 + i, addrs.clone()).await;
         addrs.push(addr);
         nodes.push(n);
     }
@@ -261,14 +300,14 @@ async fn five_node_cluster_agrees_on_coordinator() {
 
 #[tokio::test]
 async fn simultaneous_birthdates_use_memberid_tiebreaker() {
-    let _gate = lock_multi_node();
     // All five nodes claim birthdate = 100. The deterministic tiebreaker
     // is `MemberId` (smaller wins). After convergence every node must
     // agree on the *same* coordinator.
+    let hub = MockHub::new();
     let mut nodes: Vec<Arc<Cluster>> = Vec::new();
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for i in 0..5_u64 {
-        let (n, addr) = bootstrap_node(&format!("tb{i}"), 100, addrs.clone()).await;
+        let (n, addr) = bootstrap_mock_node(&hub, &format!("tb{i}"), 100, addrs.clone()).await;
         addrs.push(addr);
         nodes.push(n);
     }
