@@ -102,6 +102,12 @@ pub enum Command {
     /// since the storage engine isn't partition-aware yet; the wire shape
     /// is frozen now so future versions add semantics, not arguments.
     InternalNodeLengthOfPart { partition_id: u32 },
+    /// `INTERNAL.NODE.GETWITHTS <dmap> <key>` — Phase 5 read-quorum and
+    /// read-repair fan-out. Returns either a 2-element array
+    /// `[value, ts_unix_nanos]` (RESP integer) or a null bulk if the key
+    /// is missing. Restricted to peers authenticated with
+    /// `cluster_secret`; external clients never see this command shape.
+    InternalNodeGetWithTs { dmap: Bytes, key: Bytes },
 }
 
 /// Optional flags for `DM.PUT`.
@@ -198,6 +204,7 @@ impl Command {
             b"CLUSTER.READY" => parse_cluster_ready(&args),
             b"INTERNAL.NODE.UPDATEROUTING" => parse_internal_update_routing(args),
             b"INTERNAL.NODE.LENGTHOFPART" => parse_internal_length_of_part(args),
+            b"INTERNAL.NODE.GETWITHTS" => parse_internal_get_with_ts(args),
             _ => Err(CommandError::UnknownCommand(
                 String::from_utf8_lossy(verb_lower).into_owned(),
             )),
@@ -323,6 +330,11 @@ impl Command {
             Self::InternalNodeLengthOfPart { partition_id } => vec![
                 bulk("INTERNAL.NODE.LENGTHOFPART"),
                 bulk(&partition_id.to_string()),
+            ],
+            Self::InternalNodeGetWithTs { dmap, key } => vec![
+                bulk("INTERNAL.NODE.GETWITHTS"),
+                bulk_bytes(dmap),
+                bulk_bytes(key),
             ],
         };
         Frame::Array(Some(parts))
@@ -605,6 +617,16 @@ fn parse_internal_length_of_part(args: Vec<Bytes>) -> Result<Command, CommandErr
     let partition_raw = iter.next().unwrap();
     let partition_id = parse_int(&partition_raw, "INTERNAL.NODE.LENGTHOFPART", "partition_id")?;
     Ok(Command::InternalNodeLengthOfPart { partition_id })
+}
+
+fn parse_internal_get_with_ts(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_exact(&args, "INTERNAL.NODE.GETWITHTS", 2)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    Ok(Command::InternalNodeGetWithTs {
+        dmap: iter.next().unwrap(),
+        key: iter.next().unwrap(),
+    })
 }
 
 fn parse_dm_put(args: Vec<Bytes>) -> Result<Command, CommandError> {
@@ -1366,6 +1388,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_internal_get_with_ts_roundtrip() {
+        let cmd = Command::InternalNodeGetWithTs {
+            dmap: b("sessions"),
+            key: b("u1"),
+        };
+        assert_eq!(Command::parse(cmd.to_frame()).unwrap(), cmd);
+    }
+
+    #[test]
+    fn parse_internal_get_with_ts_wrong_arity() {
+        let frame = arr(&[b"INTERNAL.NODE.GETWITHTS", b"only-dmap"]);
+        assert_matches!(Command::parse(frame), Err(CommandError::WrongArity { .. }));
+    }
+
+    #[test]
     fn parse_unknown_verb() {
         let frame = arr(&[b"NOPE"]);
         assert_matches!(Command::parse(frame), Err(CommandError::UnknownCommand(s)) if s == "NOPE");
@@ -1600,6 +1637,8 @@ mod tests {
             bytes_strategy().prop_map(|table| Command::InternalNodeUpdateRouting { table }),
             any::<u32>()
                 .prop_map(|partition_id| Command::InternalNodeLengthOfPart { partition_id }),
+            (bytes_strategy(), bytes_strategy())
+                .prop_map(|(dmap, key)| Command::InternalNodeGetWithTs { dmap, key }),
         ]
     }
 

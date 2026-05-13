@@ -490,3 +490,192 @@ async fn lww_concurrent_write_resolves_deterministically() {
     shutdown_b.trigger();
     let _ = server_b_task.await;
 }
+
+#[tokio::test]
+async fn read_quorum_picks_highest_ts_across_replicas() {
+    // ROADMAP §6 Phase 5 surface: `read_quorum > 1` fans the read out to
+    // primary + backups and returns the value with the highest LWW
+    // timestamp. We seed P and B with different values for the same key
+    // (different timestamps) so the GET must converge on the larger TS.
+    let _ = unique_seed();
+    let secret = "phase5-readq";
+
+    let cfg_b = cluster_config(secret);
+    let leaf: Arc<dyn RoutingProvider> = Arc::new(LeafRouter);
+    let (server_b, embedded_b) = start_server(cfg_b, Some(leaf)).await;
+    let addr_b = server_b.local_addr();
+    let shutdown_b = server_b.shutdown_handle();
+    let server_b_task = tokio::spawn(server_b.run());
+
+    // Seed B with a NEWER value via the embedded client.
+    let dmap_b = embedded_b
+        .new_dmap("repl", DMapOptions::default())
+        .await
+        .unwrap();
+    dmap_b
+        .put(
+            "k",
+            b"newer-on-backup",
+            PutOptions {
+                timestamp: Some(2_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let settings = ReplicationSettings {
+        replica_count: 2,
+        write_quorum: 1,
+        read_quorum: 2,
+        read_repair: false,
+        mode: ReplicationMode::Sync,
+    };
+    let router: Arc<dyn RoutingProvider> =
+        Arc::new(ScriptedRouter::new(vec![addr_b], settings, secret));
+    let cfg_p = cluster_config(secret);
+    let (server_p, embedded_p) = start_server(cfg_p, Some(router)).await;
+    let addr_p = server_p.local_addr();
+    let shutdown_p = server_p.shutdown_handle();
+    let server_p_task = tokio::spawn(server_p.run());
+
+    // Seed P with an OLDER value for the same key (direct embedded write
+    // so we bypass the dispatcher's write-quorum fan-out).
+    let dmap_p = embedded_p
+        .new_dmap("repl", DMapOptions::default())
+        .await
+        .unwrap();
+    dmap_p
+        .put(
+            "k",
+            b"older-on-primary",
+            PutOptions {
+                timestamp: Some(1_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // GET through the public address — dispatcher reads locally, fans
+    // out to B via INTERNAL.NODE.GETWITHTS, picks the highest-TS reply.
+    let client = MultiNodeRemoteClient::connect(vec![format!("{addr_p}")], None)
+        .await
+        .unwrap();
+    let dmap = client
+        .new_dmap("repl", DMapOptions::default())
+        .await
+        .unwrap();
+    let got = dmap.get("k").await.expect("read must succeed");
+    assert_eq!(
+        got.value, b"newer-on-backup",
+        "read_quorum>1 must pick the highest-TS value across replicas",
+    );
+
+    drop(dmap);
+    let _ = client.close().await;
+    shutdown_p.trigger();
+    let _ = server_p_task.await;
+    shutdown_b.trigger();
+    let _ = server_b_task.await;
+}
+
+#[tokio::test]
+async fn read_repair_heals_stale_backup_after_primary_recovery() {
+    // ROADMAP §6 Phase 5 surface: read_repair = true → after picking the
+    // winning version, the primary propagates it back to any replica
+    // whose timestamp is strictly lower. We seed P (newer) + B (older);
+    // a GET on P must heal B via a spawned fire-and-forget repair PUT.
+    let _ = unique_seed();
+    let secret = "phase5-readrepair";
+
+    let cfg_b = cluster_config(secret);
+    let leaf: Arc<dyn RoutingProvider> = Arc::new(LeafRouter);
+    let (server_b, embedded_b) = start_server(cfg_b, Some(leaf)).await;
+    let addr_b = server_b.local_addr();
+    let shutdown_b = server_b.shutdown_handle();
+    let server_b_task = tokio::spawn(server_b.run());
+
+    let dmap_b_seed = embedded_b
+        .new_dmap("repl", DMapOptions::default())
+        .await
+        .unwrap();
+    dmap_b_seed
+        .put(
+            "k",
+            b"stale-backup",
+            PutOptions {
+                timestamp: Some(1_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let settings = ReplicationSettings {
+        replica_count: 2,
+        write_quorum: 1,
+        read_quorum: 1,
+        read_repair: true, // <-- the surface under test
+        mode: ReplicationMode::Sync,
+    };
+    let router: Arc<dyn RoutingProvider> =
+        Arc::new(ScriptedRouter::new(vec![addr_b], settings, secret));
+    let cfg_p = cluster_config(secret);
+    let (server_p, embedded_p) = start_server(cfg_p, Some(router)).await;
+    let addr_p = server_p.local_addr();
+    let shutdown_p = server_p.shutdown_handle();
+    let server_p_task = tokio::spawn(server_p.run());
+
+    let dmap_p_seed = embedded_p
+        .new_dmap("repl", DMapOptions::default())
+        .await
+        .unwrap();
+    dmap_p_seed
+        .put(
+            "k",
+            b"winner-on-primary",
+            PutOptions {
+                timestamp: Some(5_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Trigger the GET — this fires the read_repair fan-out that should
+    // push the winner to B.
+    let client = MultiNodeRemoteClient::connect(vec![format!("{addr_p}")], None)
+        .await
+        .unwrap();
+    let dmap = client
+        .new_dmap("repl", DMapOptions::default())
+        .await
+        .unwrap();
+    let got = dmap.get("k").await.unwrap();
+    assert_eq!(got.value, b"winner-on-primary");
+    drop(dmap);
+    let _ = client.close().await;
+
+    // Read_repair is fire-and-forget by design (`docs/04-replication.md`
+    // "Read Repair"); poll the backup until convergence or the deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut last = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let got_b = dmap_b_seed.get("k").await.unwrap();
+        last = got_b.value.clone();
+        if last == b"winner-on-primary" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        last, b"winner-on-primary",
+        "read_repair must propagate the winner to stale backups",
+    );
+
+    shutdown_p.trigger();
+    let _ = server_p_task.await;
+    shutdown_b.trigger();
+    let _ = server_b_task.await;
+}

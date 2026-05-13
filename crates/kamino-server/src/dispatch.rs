@@ -127,7 +127,17 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
             )
             .await
         }
-        Command::DmGet { dmap, key } => handlers::dm_get(&ctx.client, &dmap, &key).await,
+        Command::DmGet { dmap, key } => {
+            handlers::dm_get(
+                &ctx.client,
+                ctx.routing_provider.as_ref(),
+                ctx.ts_source.as_ref(),
+                state.internode,
+                &dmap,
+                &key,
+            )
+            .await
+        }
         Command::DmDel { dmap, keys } => {
             handlers::dm_del(
                 &ctx.client,
@@ -185,6 +195,9 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
         Command::InternalNodeLengthOfPart { partition_id } => {
             handlers::internal_node_length_of_part(partition_id)
         }
+        Command::InternalNodeGetWithTs { dmap, key } => {
+            handlers::internal_node_get_with_ts(&ctx.client, &dmap, &key).await
+        }
     }
 }
 
@@ -229,7 +242,9 @@ fn ctx_member_quorum_ok(ctx: &ServerContext) -> bool {
 fn is_internal_allowed(ctx: &ServerContext, state: &ConnState, cmd: &Command) -> bool {
     let is_internal = matches!(
         cmd,
-        Command::InternalNodeUpdateRouting { .. } | Command::InternalNodeLengthOfPart { .. }
+        Command::InternalNodeUpdateRouting { .. }
+            | Command::InternalNodeLengthOfPart { .. }
+            | Command::InternalNodeGetWithTs { .. }
     );
     if !is_internal {
         return true;

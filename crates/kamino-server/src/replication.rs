@@ -115,6 +115,59 @@ pub(crate) async fn replicate_put(
     aggregate(replies, "DM.PUT")
 }
 
+/// Fan an `INTERNAL.NODE.GETWITHTS` out to every backup in parallel.
+/// Each reply is decoded into either `Some((value, ts))` or `None`
+/// (missing key, transport failure, or unexpected reply shape). The
+/// returned `Vec` preserves the order of `backups` so callers can pair
+/// it back up with the original addresses for read-repair.
+pub(crate) async fn read_from_backups(
+    routing: &Arc<dyn RoutingProvider>,
+    backups: &[SocketAddr],
+    dmap: Bytes,
+    key: Bytes,
+) -> Vec<Option<(Vec<u8>, i64)>> {
+    if backups.is_empty() {
+        return Vec::new();
+    }
+    let mut futures = Vec::with_capacity(backups.len());
+    for addr in backups {
+        let cmd = Command::InternalNodeGetWithTs {
+            dmap: dmap.clone(),
+            key: key.clone(),
+        };
+        futures.push(routing.forward_command(*addr, cmd));
+    }
+    let replies = futures::future::join_all(futures).await;
+    replies.into_iter().map(decode_get_with_ts).collect()
+}
+
+fn decode_get_with_ts(
+    reply: Result<Frame, kamino_cluster::ClusterError>,
+) -> Option<(Vec<u8>, i64)> {
+    match reply {
+        Ok(Frame::Array(Some(items))) if items.len() == 2 => {
+            let value = match &items[0] {
+                Frame::Bulk(kamino_protocol::BulkString(Some(v))) => v.to_vec(),
+                _ => return None,
+            };
+            let ts = match &items[1] {
+                Frame::Integer(ts) => *ts,
+                _ => return None,
+            };
+            Some((value, ts))
+        }
+        Ok(Frame::Bulk(kamino_protocol::BulkString(None))) => None,
+        Ok(other) => {
+            warn!(reply = ?other, "unexpected INTERNAL.NODE.GETWITHTS reply");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "INTERNAL.NODE.GETWITHTS transport error");
+            None
+        }
+    }
+}
+
 /// Fan a primary-side `DM.DEL <dmap> <key>` out to `backups`. Unlike
 /// `replicate_put` this is single-key — multi-key cross-partition DEL is
 /// handled separately by the existing fan-out in `handlers::dm_del`.

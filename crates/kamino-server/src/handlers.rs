@@ -463,7 +463,141 @@ const fn put_options_from_command(options: &kamino_protocol::PutCommandOptions) 
     }
 }
 
-pub(crate) async fn dm_get(client: &Arc<dyn Client>, dmap: &Bytes, key: &Bytes) -> Response {
+pub(crate) async fn dm_get(
+    client: &Arc<dyn Client>,
+    routing: Option<&Arc<dyn RoutingProvider>>,
+    ts_source: &TimestampSource,
+    from_peer: bool,
+    dmap: &Bytes,
+    key: &Bytes,
+) -> Response {
+    let d = match dmap_handle(client, dmap).await {
+        Ok(d) => d,
+        Err(f) => return Response::ok(f),
+    };
+    let k = match key_str(key) {
+        Ok(s) => s,
+        Err(f) => return Response::ok(f),
+    };
+
+    // Internode arrivals always read locally — the primary that fanned the
+    // request out doesn't want a recursive quorum read.
+    if from_peer {
+        return match d.get(k).await {
+            Ok(resp) => Response::ok(Frame::Bulk(BulkString::from(resp.value))),
+            Err(ClientError::KeyNotFound) => Response::ok(Frame::Bulk(BulkString::null())),
+            Err(e) => Response::ok(map_client_error(e, "DM.GET")),
+        };
+    }
+
+    let local = match d.get(k).await {
+        Ok(resp) => Some(resp),
+        Err(ClientError::KeyNotFound) => None,
+        Err(e) => return Response::ok(map_client_error(e, "DM.GET")),
+    };
+
+    // Determine whether quorum / repair fan-out is needed.
+    let Some(routing) = routing else {
+        return local.map_or_else(
+            || Response::ok(Frame::Bulk(BulkString::null())),
+            |r| Response::ok(Frame::Bulk(BulkString::from(r.value))),
+        );
+    };
+    let settings = routing.replication_settings();
+    let needs_fanout = settings.read_quorum > 1 || settings.read_repair;
+    if !needs_fanout {
+        return local.map_or_else(
+            || Response::ok(Frame::Bulk(BulkString::null())),
+            |r| Response::ok(Frame::Bulk(BulkString::from(r.value))),
+        );
+    }
+
+    let backups = routing.backup_addrs_for_key(dmap, key);
+    if backups.is_empty() {
+        return local.map_or_else(
+            || Response::ok(Frame::Bulk(BulkString::null())),
+            |r| Response::ok(Frame::Bulk(BulkString::from(r.value))),
+        );
+    }
+
+    // Pull (value, ts) from every live backup. Each `(Option<value>, ts)`
+    // pair (or None on transport failure) feeds the LWW reducer below.
+    let mut replies =
+        replication::read_from_backups(routing, &backups, dmap.clone(), key.clone()).await;
+    // Push the primary's local read into the same shape.
+    replies.push(local.map(|r| (r.value, r.timestamp)));
+
+    let winner = pick_highest_ts(&replies);
+    let Some((winner_value, winner_ts)) = winner else {
+        return Response::ok(Frame::Bulk(BulkString::null()));
+    };
+
+    if settings.read_repair {
+        // Propagate the winner to every replica whose stamp is strictly
+        // lower (or whose copy is missing entirely). Use the existing
+        // primary-side LWW path: a DM.PUT with TS=winner_ts goes through
+        // the receiver's internode dispatch and lands in `put_lww`.
+        let stale_peers = stale_replicas(&backups, &replies, winner_ts);
+        if !stale_peers.is_empty() {
+            ts_source.observe(winner_ts);
+            let opts = kamino_protocol::PutCommandOptions {
+                timestamp: Some(winner_ts),
+                ..Default::default()
+            };
+            // Fire-and-forget repair — surfacing repair failures to the
+            // client would re-introduce the unavailability we replicate
+            // *against*. Errors are logged inside the replication helper.
+            let routing = Arc::clone(routing);
+            let dmap = dmap.clone();
+            let key = key.clone();
+            let value = Bytes::copy_from_slice(&winner_value);
+            tokio::spawn(async move {
+                let _ = replication::replicate_put(&routing, &stale_peers, dmap, key, value, opts)
+                    .await;
+            });
+        }
+    }
+    Response::ok(Frame::Bulk(BulkString::from(winner_value)))
+}
+
+/// Pick the `(value, ts)` with the highest timestamp from the fan-out
+/// replies. `None` entries (missing key / transport failure) are dropped.
+fn pick_highest_ts(replies: &[Option<(Vec<u8>, i64)>]) -> Option<(Vec<u8>, i64)> {
+    replies
+        .iter()
+        .filter_map(|r| r.as_ref())
+        .max_by_key(|(_, ts)| *ts)
+        .map(|(v, ts)| (v.clone(), *ts))
+}
+
+/// Identify backups whose stored timestamp is strictly below the winner
+/// (or who returned no value at all). The primary's local copy is the
+/// last entry in `replies`; backups occupy the first `backups.len()`
+/// slots in the same order.
+fn stale_replicas(
+    backups: &[std::net::SocketAddr],
+    replies: &[Option<(Vec<u8>, i64)>],
+    winner_ts: i64,
+) -> Vec<std::net::SocketAddr> {
+    backups
+        .iter()
+        .zip(replies.iter())
+        .filter_map(|(addr, reply)| {
+            let needs_repair = reply.as_ref().is_none_or(|(_, ts)| *ts < winner_ts);
+            needs_repair.then_some(*addr)
+        })
+        .collect()
+}
+
+/// Handler for `INTERNAL.NODE.GETWITHTS`. Peers authenticated with
+/// `cluster_secret` use it to satisfy the primary's read-quorum / read-
+/// repair fan-out. Returns either a 2-element array `[value, ts]` or a
+/// null bulk if the key is missing.
+pub(crate) async fn internal_node_get_with_ts(
+    client: &Arc<dyn Client>,
+    dmap: &Bytes,
+    key: &Bytes,
+) -> Response {
     let d = match dmap_handle(client, dmap).await {
         Ok(d) => d,
         Err(f) => return Response::ok(f),
@@ -473,9 +607,12 @@ pub(crate) async fn dm_get(client: &Arc<dyn Client>, dmap: &Bytes, key: &Bytes) 
         Err(f) => return Response::ok(f),
     };
     match d.get(k).await {
-        Ok(resp) => Response::ok(Frame::Bulk(BulkString::from(resp.value))),
+        Ok(resp) => Response::ok(Frame::Array(Some(vec![
+            Frame::Bulk(BulkString::from(resp.value)),
+            Frame::Integer(resp.timestamp),
+        ]))),
         Err(ClientError::KeyNotFound) => Response::ok(Frame::Bulk(BulkString::null())),
-        Err(e) => Response::ok(map_client_error(e, "DM.GET")),
+        Err(e) => Response::ok(map_client_error(e, "INTERNAL.NODE.GETWITHTS")),
     }
 }
 
