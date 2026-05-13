@@ -1,5 +1,7 @@
 # Configuration Reference
 
+> This is the **knob reference** — every setting, its default, its scope, and whether it can be hot-reloaded. For the architecture around configuration (modes, source precedence, profiles, reload triggers, validation rules, embedded vs standalone), see [Configuration Architecture](16-config-architecture.md).
+
 ## Configuration File Format
 
 Kamino uses TOML for configuration:
@@ -281,38 +283,44 @@ let config = Config {
 
 ## Default Values Summary
 
-| Parameter | Default |
-|-----------|---------|
-| `partition_count` | 271 |
-| `replica_count` | 1 |
-| `write_quorum` | 1 |
-| `read_quorum` | 1 |
-| `member_count_quorum` | 1 |
-| `replication_mode` | Sync |
-| `read_repair` | false |
-| `load_factor` | 1.25 |
-| `bind_port` | 3320 |
-| `discovery_port` | 3322 |
-| `keep_alive_period` | 300s |
-| `max_join_attempts` | 10 |
-| `join_retry_interval` | 1s |
-| `bootstrap_timeout` | 10s |
-| `leave_timeout` | 5s |
-| `routing_push_interval` | 60s |
-| `balancer_trigger_interval` | 15s |
-| `compaction_interval` | 10m |
-| `empty_fragments_check` | 60s |
-| `cluster_secret` | "" (no auth) |
-| `swim_probe_interval` | 1s |
-| `swim_probe_timeout` | 500ms |
-| `swim_indirect_probes` | 3 |
-| `swim_suspicion_multiplier` | 5 |
-| `storage_engine` | ramblock |
-| `table_size` | 1 MB |
-| `max_garbage_ratio` | 0.40 |
-| `num_eviction_workers` | 1 |
-| `lru_samples` | 5 |
-| `eviction_policy` | None |
+The **Reload** column reflects the [reload discipline](16-config-architecture.md#reload-discipline):
+
+- `bootstrap` — bootstrap-only; changing requires a restart (or coordinator-led migration in some cases).
+- `reload` — reloadable on a live node via `SIGHUP` (standalone) or `Kamino::reload_config` (embedded).
+
+| Parameter | Default | Reload |
+|-----------|---------|--------|
+| `partition_count` | 271 | bootstrap |
+| `replica_count` | 1 | bootstrap |
+| `write_quorum` | 1 | reload |
+| `read_quorum` | 1 | reload |
+| `member_count_quorum` | 1 | reload |
+| `replication_mode` | Sync | reload |
+| `read_repair` | false | reload |
+| `load_factor` | 1.25 | bootstrap |
+| `bind_port` | 3320 | bootstrap |
+| `discovery_port` | 3322 | bootstrap |
+| `keep_alive_period` | 300s | reload |
+| `max_join_attempts` | 10 | reload |
+| `join_retry_interval` | 1s | reload |
+| `bootstrap_timeout` | 10s | reload |
+| `leave_timeout` | 5s | reload |
+| `routing_push_interval` | 60s | reload |
+| `balancer_trigger_interval` | 15s | reload |
+| `compaction_interval` | 10m | reload |
+| `empty_fragments_check` | 60s | reload |
+| `cluster_secret` | "" (no auth) | bootstrap |
+| `auth.password` | "" (no auth) | reload |
+| `swim_probe_interval` | 1s | reload |
+| `swim_probe_timeout` | 500ms | reload |
+| `swim_indirect_probes` | 3 | reload |
+| `swim_suspicion_multiplier` | 5 | reload |
+| `storage_engine` | ramblock | bootstrap |
+| `table_size` | 1 MB | reload (affects newly allocated tables) |
+| `max_garbage_ratio` | 0.40 | reload |
+| `num_eviction_workers` | 1 | reload |
+| `lru_samples` | 5 | reload |
+| `eviction_policy` | None | reload |
 
 ## Production-Recommended Defaults
 
