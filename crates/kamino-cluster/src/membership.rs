@@ -186,7 +186,12 @@ impl MembershipView {
 
     /// Apply a gossip event. Returns the outcome so callers can decide
     /// whether to re-broadcast.
-    pub fn apply(&self, event: &GossipEvent, now_ns: u64, suspicion_timeout_ns: u64) -> ApplyOutcome {
+    pub fn apply(
+        &self,
+        event: &GossipEvent,
+        now_ns: u64,
+        suspicion_timeout_ns: u64,
+    ) -> ApplyOutcome {
         let mut inner = self.inner.write();
         match *event {
             GossipEvent::Alive {
@@ -205,10 +210,12 @@ impl MembershipView {
                 birthdate,
                 incarnation,
             ),
-            GossipEvent::Suspect { id, incarnation, .. } => {
-                apply_suspect(&mut inner, id, incarnation, now_ns, suspicion_timeout_ns)
-            }
-            GossipEvent::Dead { id, incarnation, .. } => apply_dead(&mut inner, id, incarnation),
+            GossipEvent::Suspect {
+                id, incarnation, ..
+            } => apply_suspect(&mut inner, id, incarnation, now_ns, suspicion_timeout_ns),
+            GossipEvent::Dead {
+                id, incarnation, ..
+            } => apply_dead(&mut inner, id, incarnation),
             GossipEvent::Leave { id, incarnation } => apply_dead(&mut inner, id, incarnation),
         }
     }
@@ -269,7 +276,16 @@ fn apply_alive(
     let entry = inner.by_id.get(&id).cloned();
     match entry {
         Some(existing) if incarnation < existing.incarnation => ApplyOutcome::Ignored,
-        Some(existing) if incarnation == existing.incarnation && existing.state == MemberState::Alive => {
+        Some(existing)
+            if incarnation == existing.incarnation && existing.state == MemberState::Alive =>
+        {
+            ApplyOutcome::Ignored
+        }
+        // Dead is absorbing within an incarnation — only a strictly higher
+        // incarnation can refute (SWIM, Das/Gupta/Motivala §4).
+        Some(existing)
+            if incarnation == existing.incarnation && existing.state == MemberState::Dead =>
+        {
             ApplyOutcome::Ignored
         }
         Some(_) => {
@@ -333,16 +349,19 @@ fn apply_suspect(
     if incarnation < entry.incarnation {
         return ApplyOutcome::Ignored;
     }
-    match entry.state {
-        MemberState::Dead => ApplyOutcome::Ignored,
-        MemberState::Suspect if incarnation == entry.incarnation => ApplyOutcome::Ignored,
-        _ => {
-            entry.state = MemberState::Suspect;
-            entry.incarnation = incarnation;
-            entry.suspect_deadline_ns = now_ns.saturating_add(suspicion_timeout_ns);
-            ApplyOutcome::Updated
-        }
+    // Dead is absorbing only at the same incarnation; Suspect at the same
+    // incarnation is a no-op. A strictly higher incarnation means the member
+    // refuted earlier and is now suspect again at a fresher epoch, so it
+    // advances.
+    let same_inc_noop = incarnation == entry.incarnation
+        && matches!(entry.state, MemberState::Dead | MemberState::Suspect);
+    if same_inc_noop {
+        return ApplyOutcome::Ignored;
     }
+    entry.state = MemberState::Suspect;
+    entry.incarnation = incarnation;
+    entry.suspect_deadline_ns = now_ns.saturating_add(suspicion_timeout_ns);
+    ApplyOutcome::Updated
 }
 
 fn apply_dead(inner: &mut Inner, id: MemberId, incarnation: Incarnation) -> ApplyOutcome {
@@ -356,7 +375,8 @@ fn apply_dead(inner: &mut Inner, id: MemberId, incarnation: Incarnation) -> Appl
     if incarnation < entry.incarnation {
         return ApplyOutcome::Ignored;
     }
-    if entry.state == MemberState::Dead {
+    // Idempotent at the same incarnation; advance on strictly higher.
+    if entry.state == MemberState::Dead && incarnation == entry.incarnation {
         return ApplyOutcome::Ignored;
     }
     entry.state = MemberState::Dead;

@@ -80,3 +80,134 @@ impl Transport for UdpTransport {
         Ok(self.socket.local_addr()?)
     }
 }
+
+#[cfg(any(test, feature = "mock-transport"))]
+pub use mock::{MockHub, MockTransport};
+
+#[cfg(any(test, feature = "mock-transport"))]
+mod mock {
+    //! In-memory transport for deterministic SWIM tests.
+    //!
+    //! Two or more [`MockTransport`] instances share a [`MockHub`] that routes
+    //! `Envelope`s by destination [`SocketAddr`]. The receive side is a
+    //! per-instance unbounded channel — sufficient for unit tests where the
+    //! receive loop drains promptly.
+
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::mpsc;
+
+    use super::Transport;
+    use crate::error::{ClusterError, ClusterResult};
+    use crate::message::Envelope;
+
+    type Inbox = mpsc::UnboundedSender<(Envelope, SocketAddr)>;
+
+    /// Shared routing table for a set of paired [`MockTransport`] endpoints.
+    #[derive(Debug, Clone, Default)]
+    pub struct MockHub {
+        inner: Arc<Mutex<HubInner>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct HubInner {
+        routes: HashMap<SocketAddr, Inbox>,
+        /// Addresses that have been partitioned off. Sends from / to these
+        /// addresses are silently dropped, modelling network failure.
+        partitioned: std::collections::HashSet<SocketAddr>,
+        /// Directional link drops `(from, to)` — useful when modelling
+        /// asymmetric reachability (A can't reach B but C can still reach B).
+        dropped_links: std::collections::HashSet<(SocketAddr, SocketAddr)>,
+    }
+
+    impl MockHub {
+        /// Construct an empty hub.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Register a new endpoint and return the matching [`MockTransport`].
+        pub fn endpoint(&self, addr: SocketAddr) -> MockTransport {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.inner.lock().routes.insert(addr, tx);
+            MockTransport {
+                local: addr,
+                hub: self.clone(),
+                rx: AsyncMutex::new(rx),
+            }
+        }
+
+        /// Mark an endpoint as partitioned: send-to and recv-from it are
+        /// silently dropped.
+        pub fn partition(&self, addr: SocketAddr) {
+            self.inner.lock().partitioned.insert(addr);
+        }
+
+        /// Restore an endpoint to normal routing.
+        pub fn heal(&self, addr: SocketAddr) {
+            self.inner.lock().partitioned.remove(&addr);
+        }
+
+        /// Drop packets going from `from` to `to`. The reverse direction is
+        /// unaffected — model asymmetric reachability.
+        pub fn drop_link(&self, from: SocketAddr, to: SocketAddr) {
+            self.inner.lock().dropped_links.insert((from, to));
+        }
+
+        /// Restore a previously dropped link.
+        pub fn restore_link(&self, from: SocketAddr, to: SocketAddr) {
+            self.inner.lock().dropped_links.remove(&(from, to));
+        }
+
+        fn route(&self, env: Envelope, from: SocketAddr, to: SocketAddr) -> ClusterResult<()> {
+            let inner = self.inner.lock();
+            if inner.partitioned.contains(&from) || inner.partitioned.contains(&to) {
+                return Ok(());
+            }
+            if inner.dropped_links.contains(&(from, to)) {
+                return Ok(());
+            }
+            let inbox = inner.routes.get(&to).cloned();
+            drop(inner);
+            let Some(inbox) = inbox else {
+                // Drop silently — UDP semantics for an unbound peer.
+                return Ok(());
+            };
+            inbox
+                .send((env, from))
+                .map_err(|_| ClusterError::Io(std::io::Error::other("mock transport: peer gone")))
+        }
+    }
+
+    /// In-memory `Transport` implementation backed by a [`MockHub`].
+    #[allow(missing_debug_implementations)]
+    pub struct MockTransport {
+        local: SocketAddr,
+        hub: MockHub,
+        rx: AsyncMutex<mpsc::UnboundedReceiver<(Envelope, SocketAddr)>>,
+    }
+
+    #[async_trait]
+    impl Transport for MockTransport {
+        async fn recv(&self) -> ClusterResult<(Envelope, SocketAddr)> {
+            let mut rx = self.rx.lock().await;
+            rx.recv()
+                .await
+                .ok_or_else(|| ClusterError::Io(std::io::Error::other("mock transport closed")))
+        }
+
+        async fn send_to(&self, env: &Envelope, dst: SocketAddr) -> ClusterResult<()> {
+            self.hub.route(env.clone(), self.local, dst)
+        }
+
+        fn local_addr(&self) -> ClusterResult<SocketAddr> {
+            Ok(self.local)
+        }
+    }
+}

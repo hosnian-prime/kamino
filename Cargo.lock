@@ -664,6 +664,7 @@ dependencies = [
  "assert_matches",
  "async-trait",
  "bytes",
+ "kamino-cluster",
  "kamino-core",
  "kamino-observability",
  "kamino-protocol",
