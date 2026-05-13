@@ -51,7 +51,7 @@ There is no built-in TLS for either client or inter-node traffic. **Both the cli
 |---------|--------|-------------|
 | `DM.PUT` | `DM.PUT dmap key value [EX s] [PX ms] [EXAT ts] [PXAT ts] [NX\|XX] [TS unix-nanos]` | Store a key-value pair (TS overrides server-assigned timestamp; see Put Options) |
 | `DM.GET` | `DM.GET dmap key` | Retrieve a value by key |
-| `DM.DEL` | `DM.DEL dmap key [key ...]` | Delete one or more keys |
+| `DM.DEL` | `DM.DEL dmap key [key ...]` | Delete one or more keys. Cross-partition keys are fanned out server-side; see [Multi-Key Operations](#multi-key-operations) for semantics. |
 | `DM.EXPIRE` | `DM.EXPIRE dmap key seconds` | Set TTL in seconds |
 | `DM.PEXPIRE` | `DM.PEXPIRE dmap key milliseconds` | Set TTL in milliseconds |
 | `DM.INCR` | `DM.INCR dmap key delta` | Increment integer value (serialized at partition primary; lost-update under partition — see [Replication](04-replication.md#incrdecr-lost-update-warning)) |
@@ -76,6 +76,24 @@ There is no built-in TLS for either client or inter-node traffic. **Both the cli
 | `NX` | Only set if key does **not** exist |
 | `XX` | Only set if key **already** exists |
 | `TS unix-nanos` | Override the server-assigned LWW timestamp. Use with care — see [LWW](04-replication.md#timestamp-source) |
+
+### Multi-Key Operations
+
+`DM.DEL` is the only command in the DMap set that accepts multiple keys. Unlike Redis Cluster — which rejects multi-key commands that cross slots with `CROSSSLOT` and forces clients to use hash tags or split requests — Kamino fans out internally:
+
+1. The receiving node groups the input keys by partition primary using the local routing table.
+2. For each distinct primary, the node issues a single `DM.DEL` to that primary covering all keys mapped there. Local-owned keys are deleted in-process.
+3. Per-primary RPCs run in parallel, bounded by the per-peer inflight limit (see [Inter-Node Communication](#inter-node-communication)).
+4. The reply is the **sum of successfully deleted live keys** across all primaries.
+
+**Semantics:**
+
+- **Not atomic across partitions.** A partial failure (one primary unreachable, quorum lost on one shard) is reported as a `+PARTIAL` reply carrying `(deleted_count, first_error)`. Successful deletions on reachable primaries are **not** rolled back.
+- **Quorum check is per-primary.** If `member_count_quorum` is not satisfied on the receiving node, the entire request fails before any fan-out. If it is satisfied on the receiver but a downstream primary's view differs, that primary's deletes return `ErrClusterQuorum`.
+- **Reordering.** The order in which individual deletes hit each primary is unspecified. Callers that need ordering must serialize at the application level.
+- **No `DM.MGET`/`DM.MPUT`.** Read and write multi-key forms are deliberately not provided. A `pipeline` over single-key operations is the supported pattern; it makes the per-key error visible and avoids hiding cross-partition cost behind a single command.
+
+If you want Redis Cluster semantics (single-slot guarantee, fail loudly on cross-slot), set `multi_key_strict = true` under `[network]` — the server then rejects multi-key requests that span partitions with `ErrCrossPartition`.
 
 ### Pub/Sub Commands
 
@@ -131,6 +149,39 @@ Client ──DM.PUT──> Node-A (not owner)
                      │
 Client <──OK───────┘
 ```
+
+### Connection Pool
+
+Each node maintains a small **per-peer connection pool**. Connections are pipelined: a single TCP connection carries many in-flight RESP requests, demuxed by response order. This matches Cassandra's multiplexed driver model (per-node pool, many concurrent streams per connection) rather than the one-request-per-connection RDBMS pattern.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `internode_pool_size` | 4 | TCP connections per peer |
+| `internode_inflight_per_conn` | 256 | Maximum in-flight requests per connection before queueing |
+| `internode_connect_timeout` | 500ms | New-connection establishment timeout |
+| `internode_request_timeout` | 2s | Per-request deadline (forwarded RPC) |
+| `internode_reconnect_backoff` | 100ms..5s | Exponential reconnect on failure |
+
+Connections are evicted from the pool when the peer leaves SWIM membership; in-flight requests on those connections receive `ErrServerGone` and the caller is expected to retry against the new owner.
+
+### Backpressure
+
+The forward path can become a bottleneck if a downstream peer is slow. Three mechanisms cap memory growth:
+
+1. **TCP socket buffers.** When the peer's kernel inbound buffer fills, the receiver's TCP advertised window shrinks. Tokio's reader stops pulling from the socket, which propagates to the writer on the sending side. This is the same mechanism Cassandra uses via Netty's `autoread=false`.
+2. **Per-peer inflight cap.** Each peer connection has a bounded queue (`internode_inflight_per_conn`). When the queue is full, the forwarder applies internal pushback: the next forward call awaits a permit. The caller's RESP server keeps reading from the client, but commands queue at the forward stage rather than blocking the per-connection read loop. This avoids head-of-line blocking *between* clients of the same node, at the cost of bounded latency growth for the slow-peer destination.
+3. **Per-peer request timeout.** Any forwarded RPC older than `internode_request_timeout` is cancelled and returns `ErrTimeout` to the originating client. Timed-out RPCs free their permit immediately.
+
+Bounded queues are mandatory in any peer-to-peer forwarding system; an unbounded queue turns a transient slow peer into an OOM. The defaults above are conservative for in-DC traffic; cross-DC deployments should raise `internode_request_timeout` to at least `2 × RTT_p99`.
+
+### Failure Handling on the Forward Path
+
+| Failure | Behavior |
+|---------|----------|
+| Peer connection error mid-flight | All in-flight requests on that connection return `ErrServerGone`. Pool reopens the connection in the background with `internode_reconnect_backoff`. |
+| Peer marked dead by SWIM | Pool drained, connections closed, queued requests returned with `ErrServerGone`. Routing table refresh routes future requests to the new owner. |
+| `internode_request_timeout` exceeded | Request returns `ErrTimeout`. The originating client decides whether to retry (typically yes for idempotent ops, with caller-supplied jitter). |
+| Routing-table staleness | If the forwarded RPC returns `ErrMoved` (peer no longer owns the partition), the local node refreshes the routing table and retries once. Repeated `ErrMoved` after refresh returns the error to the client. |
 
 ## Metrics
 

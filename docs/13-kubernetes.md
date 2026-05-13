@@ -144,9 +144,53 @@ kubernetes_namespace = "default"       # or set via KAMINO_KUBERNETES_NAMESPACE 
 kubernetes_service = "kamino"          # service name only, not FQDN — the Endpoints API uses namespace + name
 label_selector = "app=kamino"
 bind_port = 3322
+include_not_ready = true               # consume Endpoints `notReadyAddresses` so peers find each other during bootstrap
 ```
 
 **Namespace resolution order**: (1) `KAMINO_KUBERNETES_NAMESPACE` env var, (2) `kubernetes_namespace` config field, (3) fallback: read from `/var/run/secrets/kubernetes.io/serviceaccount/namespace` (auto-mounted by K8s).
+
+### Discovery Returns Not-Ready Pods Too
+
+```rust
+async fn discover(&self) -> Result<Vec<SocketAddr>> {
+    let endpoints = self.kube_client
+        .get_endpoints(&self.namespace, &self.service_name)?;
+
+    // Both `addresses` (ready) and `notReadyAddresses` (booting, failing probe) are
+    // valid SWIM peers. SWIM does its own liveness check via ping — it does not
+    // depend on the K8s readiness signal. Excluding not-ready pods here is what
+    // creates the bootstrap deadlock.
+    let addrs = endpoints.subsets
+        .iter()
+        .flat_map(|s| s.addresses.iter().chain(s.not_ready_addresses.iter()))
+        .map(|addr| SocketAddr::new(addr.ip.parse().unwrap(), self.port))
+        .collect();
+
+    Ok(addrs)
+}
+```
+
+## First Pod Bootstrap
+
+The bootstrap path is the most failure-prone moment of a stateful cluster's life. Three rules make it deterministic:
+
+1. **`publishNotReadyAddresses: true` on the headless Service** (above) — so DNS-based discovery sees pods before they pass readiness.
+2. **`include_not_ready = true` in the Kubernetes discovery plugin** (above) — so the Endpoints-API path also sees them. SWIM, not the K8s probe, is the authority on whether a peer is reachable.
+3. **`podManagementPolicy: Parallel` on the StatefulSet** — peers come up simultaneously instead of waiting for `kamino-0` to pass readiness before starting `kamino-1`.
+
+With all three in place:
+
+```
+t=0   All N pods start in parallel
+t=0+  Each pod queries Endpoints → sees the others under `notReadyAddresses`
+t=1s  SWIM gossip converges; oldest pod (by birthdate) is coordinator
+t=1s+ Coordinator builds routing table, signature=1, pushes to all
+t=2s  Every pod has routing table + member_count ≥ quorum → CLUSTER.READY passes
+t=2s+ K8s moves pods from notReadyAddresses → addresses
+      Service starts routing client traffic
+```
+
+Without these settings, the canonical failure is: `kamino-0` starts alone, `member_count_quorum = 2` is unmet, `CLUSTER.READY` fails, K8s never advertises the pod, `kamino-1` never discovers it. The cluster never forms. **Do not skip any of the three.**
 
 ## Kubernetes Manifests
 
@@ -158,7 +202,8 @@ kind: Service
 metadata:
   name: kamino
 spec:
-  clusterIP: None          # headless — no load balancing, returns all pod IPs
+  clusterIP: None                  # headless — no load balancing, returns all pod IPs
+  publishNotReadyAddresses: true   # required for first-pod bootstrap; see "First Pod Bootstrap" below
   selector:
     app: kamino
   ports:
@@ -170,8 +215,10 @@ spec:
       protocol: TCP
     - name: gossip-udp
       port: 3322
-      protocol: UDP        # SWIM uses both TCP and UDP on the same port; both must be declared
+      protocol: UDP                # SWIM uses both TCP and UDP on the same port; both must be declared
 ```
+
+> **Why `publishNotReadyAddresses: true`.** A pod's IP is only added to the headless Service's DNS records and Endpoints `addresses` list once it passes its readiness probe. The Kamino `CLUSTER.READY` probe requires the pod to have received a routing table — which depends on joining a cluster — which depends on discovering peers via this same Service. Without `publishNotReadyAddresses`, the first pod (and any subsequent pod that boots while no peer is ready) sees an empty peer list and the cluster never forms. Setting this flag lets pods discover each other before they pass readiness; the probe still gates *client* traffic.
 
 ### StatefulSet
 
@@ -181,8 +228,9 @@ kind: StatefulSet
 metadata:
   name: kamino
 spec:
-  serviceName: kamino       # binds to headless service
+  serviceName: kamino           # binds to headless service
   replicas: 3
+  podManagementPolicy: Parallel # SWIM is peer-to-peer; ordered startup is unnecessary and slow
   selector:
     matchLabels:
       app: kamino

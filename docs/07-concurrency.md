@@ -31,8 +31,8 @@ Additionally, a dedicated `update_routing_mutex` serializes routing table update
 
 ```rust
 pub struct RoutingTable {
-    inner: RwLock<RoutingTableInner>,
-    update_mutex: Mutex<()>, // serializes routing updates
+    inner: tokio::sync::RwLock<RoutingTableInner>,
+    update_mutex: tokio::sync::Mutex<()>, // serializes routing updates across async tasks
 }
 ```
 
@@ -42,7 +42,7 @@ The DMap service maintains a registry of active DMaps:
 
 ```rust
 pub struct DMapService {
-    dmaps: RwLock<HashMap<String, Arc<DMap>>>,
+    dmaps: tokio::sync::RwLock<HashMap<String, Arc<DMap>>>,
 }
 ```
 
@@ -57,7 +57,7 @@ Each fragment (a DMap's data within a partition) has its own `RwLock`:
 
 ```rust
 pub struct Fragment {
-    storage: RwLock<Box<dyn StorageEngine>>,
+    storage: tokio::sync::RwLock<Box<dyn StorageEngine>>,
     config: FragmentConfig,
 }
 ```
@@ -76,11 +76,15 @@ For atomic operations (`INCR`, `DECR`, `GETPUT`, `INCRBYFLOAT`), a fine-grained 
 
 ```rust
 pub struct Locker {
-    locks: Mutex<HashMap<String, Arc<LockEntry>>>,
+    /// Sync mutex: held only briefly for map lookup/insert, never across `.await`.
+    /// `parking_lot::Mutex` chosen for its faster uncontended path and no poisoning.
+    locks: parking_lot::Mutex<HashMap<String, Arc<LockEntry>>>,
 }
 
 struct LockEntry {
-    mutex: Mutex<()>,
+    /// Async mutex: the holder yields while inside the critical section
+    /// (which may `await` storage I/O). Must be tokio-aware.
+    mutex: tokio::sync::Mutex<()>,
     waiters: AtomicI32,
 }
 ```
@@ -103,16 +107,33 @@ impl Locker {
 ### Usage in Atomic Operations
 
 ```rust
-fn incr(&self, key: &str, delta: i64) -> Result<i64> {
-    let _guard = self.locker.lock(key); // key-level lock
-    let current = self.get(key)?;
+async fn incr(&self, key: &str, delta: i64) -> Result<i64> {
+    // Per-key lock prevents the TOCTOU race on the read-modify-write below.
+    // The guard is held across `.await` points — `LockEntry.mutex` is `tokio::sync::Mutex`
+    // for exactly this reason. A `std::sync::Mutex` here would block the runtime thread.
+    let _guard = self.locker.lock(key).await;
+    let current = self.get(key).await?;
     let new_value = current + delta;
-    self.put(key, new_value)?;
+    self.put(key, new_value).await?;
     Ok(new_value)
 }
 ```
 
 Without key-level locking, concurrent `INCR` operations on the same key would have a TOCTOU race.
+
+### Sync vs Async Mutex
+
+Kamino uses three lock primitives, deliberately:
+
+| Primitive | Where used | Held across `.await`? |
+|-----------|------------|------------------------|
+| `tokio::sync::RwLock` | Routing table, DMap registry, fragment storage | Yes |
+| `tokio::sync::Mutex` | Per-key `LockEntry`, routing-table update serialization | Yes |
+| `parking_lot::Mutex` | `Locker.locks` map, in-memory counters, gauges | **Never** |
+
+**The rule is non-negotiable.** Holding a `std::sync::Mutex` or `parking_lot::Mutex` across an `.await` blocks the executor thread, can deadlock on a single-thread runtime, and silently starves other tasks on a multi-thread one. Tokio's own tutorial flags this as the primary footgun of mixing sync and async lock types. Code review enforces the rule; the borrow checker does not catch it because `parking_lot::MutexGuard` is `Send`.
+
+Quick test when reading a diff: trace from every sync-mutex acquisition to its `Drop`. If any `.await` sits between them, the lock is wrong.
 
 ## Routing Table Push Concurrency
 
