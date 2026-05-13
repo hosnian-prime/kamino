@@ -270,7 +270,7 @@ impl Default for ReplicationMode {
 // [network]
 // ---------------------------------------------------------------------------
 
-/// `[network]` section: RESP listener tuning.
+/// `[network]` section: RESP listener tuning + inter-node forward tunables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
@@ -281,6 +281,26 @@ pub struct NetworkConfig {
     /// `Duration::ZERO` means idle close disabled.
     #[serde(with = "humantime_serde")]
     pub idle_close: Duration,
+    /// When true, multi-key requests that span partitions are rejected with
+    /// `ErrCrossPartition` (Redis-Cluster-like semantics). When false
+    /// (default), the server fans out per `docs/06-network-protocol.md`.
+    pub multi_key_strict: bool,
+    /// Inter-node TCP connections per peer.
+    pub internode_pool_size: u32,
+    /// Maximum in-flight RESP requests per pooled connection.
+    pub internode_inflight_per_conn: u32,
+    /// Establishment deadline for a fresh peer connection.
+    #[serde(with = "humantime_serde")]
+    pub internode_connect_timeout: Duration,
+    /// Per-RPC deadline for a forwarded command.
+    #[serde(with = "humantime_serde")]
+    pub internode_request_timeout: Duration,
+    /// Minimum reconnect backoff (exponential).
+    #[serde(with = "humantime_serde")]
+    pub internode_reconnect_backoff_min: Duration,
+    /// Maximum reconnect backoff (exponential cap).
+    #[serde(with = "humantime_serde")]
+    pub internode_reconnect_backoff_max: Duration,
 }
 
 impl Default for NetworkConfig {
@@ -290,6 +310,13 @@ impl Default for NetworkConfig {
             bind_port: 3320,
             keep_alive_period: Duration::from_secs(300),
             idle_close: Duration::ZERO,
+            multi_key_strict: false,
+            internode_pool_size: 4,
+            internode_inflight_per_conn: 256,
+            internode_connect_timeout: Duration::from_millis(500),
+            internode_request_timeout: Duration::from_secs(2),
+            internode_reconnect_backoff_min: Duration::from_millis(100),
+            internode_reconnect_backoff_max: Duration::from_secs(5),
         }
     }
 }
@@ -298,6 +325,36 @@ impl NetworkConfig {
     fn validate(&self) -> Result<()> {
         if self.bind_port == 0 {
             return Err(Error::Config("network.bind_port must be non-zero".into()));
+        }
+        if self.internode_pool_size == 0 {
+            return Err(Error::Config(
+                "network.internode_pool_size must be >= 1".into(),
+            ));
+        }
+        if self.internode_inflight_per_conn == 0 {
+            return Err(Error::Config(
+                "network.internode_inflight_per_conn must be >= 1".into(),
+            ));
+        }
+        if self.internode_connect_timeout.is_zero() {
+            return Err(Error::Config(
+                "network.internode_connect_timeout must be > 0".into(),
+            ));
+        }
+        if self.internode_request_timeout.is_zero() {
+            return Err(Error::Config(
+                "network.internode_request_timeout must be > 0".into(),
+            ));
+        }
+        if self.internode_reconnect_backoff_min.is_zero() {
+            return Err(Error::Config(
+                "network.internode_reconnect_backoff_min must be > 0".into(),
+            ));
+        }
+        if self.internode_reconnect_backoff_max < self.internode_reconnect_backoff_min {
+            return Err(Error::Config(
+                "network.internode_reconnect_backoff_max must be >= min".into(),
+            ));
         }
         Ok(())
     }

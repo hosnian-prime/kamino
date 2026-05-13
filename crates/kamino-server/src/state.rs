@@ -10,6 +10,11 @@ use kamino_protocol::ProtocolVersion;
 pub(crate) struct ConnState {
     pub(crate) auth: AuthState,
     pub(crate) version: ProtocolVersion,
+    /// `true` once the peer has authenticated with the configured
+    /// `cluster_secret` rather than (or in addition to) the client
+    /// password. Gates `INTERNAL.NODE.*` commands per
+    /// `docs/06-network-protocol.md`.
+    pub(crate) internode: bool,
     /// Reserved for Phase 7 pub/sub. Always `false` in Phase 2; the field
     /// exists so the connection-loop layout doesn't need to grow when
     /// `SUBSCRIBE` arrives.
@@ -40,6 +45,7 @@ impl ConnState {
         Self {
             auth,
             version: ProtocolVersion::Resp2,
+            internode: false,
             pub_sub_mode: false,
             client_name: None,
         }

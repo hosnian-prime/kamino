@@ -690,6 +690,15 @@ fn check_not_error(frame: &Frame) -> Result<()> {
 
 /// Map an `-ERR ...` server reply into a `kamino_client::Error`.
 fn translate_error(msg: &str) -> Error {
+    if let Some(rest) = msg.strip_prefix("MOVED ") {
+        let mut parts = rest.splitn(2, ' ');
+        let partition = parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let addr = parts.next().unwrap_or("").to_string();
+        return Error::Moved { partition, addr };
+    }
     if let Some(rest) = msg.strip_prefix("NOAUTH ") {
         return Error::Auth(rest.to_string());
     }
@@ -699,6 +708,9 @@ fn translate_error(msg: &str) -> Error {
     if let Some(rest) = msg.strip_prefix("CURSOR ") {
         let _ = rest;
         return Error::InvalidCursor;
+    }
+    if let Some(rest) = msg.strip_prefix("CROSSPARTITION ") {
+        return Error::InvalidArgument(format!("CROSSPARTITION {rest}"));
     }
     if let Some(rest) = msg.strip_prefix("ERR ") {
         // Heuristic pattern matching for well-known sub-errors.

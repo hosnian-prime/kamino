@@ -130,6 +130,21 @@ impl Server {
         .await
     }
 
+    /// Bind with arbitrary `MemberProvider` / `RoutingProvider` impls. Used
+    /// by integration tests that need to inject a stub routing view
+    /// (Phase 4 MOVED-retry end-to-end coverage).
+    pub async fn bind_with_providers(
+        config: &Config,
+        client: Arc<dyn Client>,
+        member_provider: Option<Arc<dyn MemberProvider>>,
+        routing_provider: Option<Arc<dyn RoutingProvider>>,
+    ) -> Result<Self, ServerError> {
+        if config.mode != Mode::Standalone {
+            return Err(ServerError::WrongMode(config.mode.as_str()));
+        }
+        Self::bind_internal(config, client, member_provider, routing_provider).await
+    }
+
     async fn bind_internal(
         config: &Config,
         client: Arc<dyn Client>,
@@ -146,6 +161,7 @@ impl Server {
         let ctx = Arc::new(ServerContext {
             client,
             password: config.auth.password.clone(),
+            cluster_secret: config.auth.cluster_secret.clone(),
             metrics: Arc::new(ServerMetrics::new()),
             version: env!("CARGO_PKG_VERSION"),
             id,

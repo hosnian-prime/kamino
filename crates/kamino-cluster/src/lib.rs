@@ -30,6 +30,7 @@
 pub mod cluster;
 pub mod discovery;
 pub mod error;
+pub mod forwarder;
 pub mod gossip;
 pub mod join;
 pub mod membership;
@@ -43,6 +44,7 @@ pub use cluster::{Cluster, ClusterDeps, MemberProvider, MemberSummary, RoutingPr
 pub use discovery::DnsDiscovery;
 pub use discovery::{DiscoveryPlugin, StaticDiscovery};
 pub use error::{ClusterError, ClusterResult};
+pub use forwarder::{Connector, Forwarder, ForwarderConfig, TcpConnector};
 pub use gossip::GossipQueue;
 pub use join::{JOIN_TARGET_SENTINEL, JoinParams, join};
 pub use membership::{ApplyOutcome, MemberEntry, MemberState, MembershipView};

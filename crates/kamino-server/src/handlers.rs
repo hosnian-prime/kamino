@@ -56,9 +56,18 @@ pub(crate) fn quit() -> Response {
 pub(crate) fn auth(
     state: &mut ConnState,
     server_password: &str,
+    cluster_secret: &str,
     username: Option<&Bytes>,
     password: &Bytes,
 ) -> Response {
+    // Match the inter-node `cluster_secret` first: an empty secret means
+    // "this deployment does not run inter-node auth", in which case we
+    // ignore that branch and fall through to client-password matching.
+    if !cluster_secret.is_empty() && password.as_ref() == cluster_secret.as_bytes() {
+        state.auth = AuthState::Authenticated;
+        state.internode = true;
+        return Response::ok(Frame::ok());
+    }
     if server_password.is_empty() {
         return Response::ok(Frame::Error(NO_PASSWORD_SET.into()));
     }
@@ -69,6 +78,7 @@ pub(crate) fn auth(
     }
     if password.as_ref() == server_password.as_bytes() {
         state.auth = AuthState::Authenticated;
+        state.internode = false;
         Response::ok(Frame::ok())
     } else {
         Response::ok(Frame::Error(WRONGPASS.into()))
@@ -78,12 +88,19 @@ pub(crate) fn auth(
 pub(crate) fn hello(
     state: &mut ConnState,
     server_password: &str,
+    cluster_secret: &str,
     args: &HelloArgs,
     server_version: &str,
     server_id: u64,
 ) -> Response {
     if let Some((username, password)) = &args.auth {
-        let resp = auth(state, server_password, username.as_ref(), password);
+        let resp = auth(
+            state,
+            server_password,
+            cluster_secret,
+            username.as_ref(),
+            password,
+        );
         if matches!(resp.frame, Frame::Error(_)) {
             return resp;
         }
@@ -357,27 +374,98 @@ pub(crate) async fn dm_get(client: &Arc<dyn Client>, dmap: &Bytes, key: &Bytes) 
     }
 }
 
-pub(crate) async fn dm_del(client: &Arc<dyn Client>, dmap: &Bytes, keys: &[Bytes]) -> Response {
+pub(crate) async fn dm_del(
+    client: &Arc<dyn Client>,
+    routing: Option<&Arc<dyn kamino_cluster::RoutingProvider>>,
+    dmap: &Bytes,
+    keys: &[Bytes],
+) -> Response {
     if keys.is_empty() {
         return Response::ok(Frame::Integer(0));
     }
-    let d = match dmap_handle(client, dmap).await {
-        Ok(d) => d,
-        Err(f) => return Response::ok(f),
+
+    // Standalone (no routing): local delete only.
+    let Some(routing) = routing else {
+        return dm_del_local(client, dmap, keys).await;
     };
+
+    // Bucket keys by primary owner. `None` = local; `Some(addr)` = remote.
+    let mut buckets: std::collections::HashMap<Option<std::net::SocketAddr>, Vec<Bytes>> =
+        std::collections::HashMap::new();
+    for key in keys {
+        let owner = routing.route_key(dmap, key);
+        buckets.entry(owner).or_default().push(key.clone());
+    }
+
+    let crossed_partitions = buckets.len() > 1
+        || (buckets.len() == 1 && buckets.keys().next().is_some_and(Option::is_some));
+    if crossed_partitions && routing.multi_key_strict() {
+        return Response::ok(Frame::Error(
+            "CROSSPARTITION keys span multiple partitions; multi_key_strict is enabled".into(),
+        ));
+    }
+
+    let mut deleted = 0_i64;
+    let mut first_error: Option<String> = None;
+    if let Some(local_keys) = buckets.remove(&None) {
+        match dm_del_local_count(client, dmap, &local_keys).await {
+            Ok(n) => deleted += n,
+            Err(frame) => return Response::ok(frame),
+        }
+    }
+    // Fan out remote buckets in parallel — bounded by the per-peer
+    // forwarder inflight semaphore inside RoutingProvider::forward_dm_del.
+    let remote: Vec<(std::net::SocketAddr, Vec<Bytes>)> = buckets
+        .into_iter()
+        .filter_map(|(addr, keys)| addr.map(|a| (a, keys)))
+        .collect();
+    if !remote.is_empty() {
+        let mut futures = Vec::with_capacity(remote.len());
+        for (addr, keys) in remote {
+            futures.push(routing.forward_dm_del(addr, dmap.clone(), keys));
+        }
+        let results = futures::future::join_all(futures).await;
+        for r in results {
+            match r {
+                Ok(n) => deleted += n,
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(format!("{e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        return Response::ok(Frame::SimpleString(format!("PARTIAL {deleted} {err}")));
+    }
+    Response::ok(Frame::Integer(deleted))
+}
+
+async fn dm_del_local(client: &Arc<dyn Client>, dmap: &Bytes, keys: &[Bytes]) -> Response {
+    match dm_del_local_count(client, dmap, keys).await {
+        Ok(n) => Response::ok(Frame::Integer(n)),
+        Err(frame) => Response::ok(frame),
+    }
+}
+
+async fn dm_del_local_count(
+    client: &Arc<dyn Client>,
+    dmap: &Bytes,
+    keys: &[Bytes],
+) -> Result<i64, Frame> {
+    let d = dmap_handle(client, dmap).await?;
     let mut deleted = 0_i64;
     for key in keys {
-        let k = match key_str(key) {
-            Ok(s) => s,
-            Err(f) => return Response::ok(f),
-        };
+        let k = key_str(key)?;
         match d.delete(k).await {
             Ok(true) => deleted += 1,
             Ok(false) => {}
-            Err(e) => return Response::ok(map_client_error(e, "DM.DEL")),
+            Err(e) => return Err(map_client_error(e, "DM.DEL")),
         }
     }
-    Response::ok(Frame::Integer(deleted))
+    Ok(deleted)
 }
 
 pub(crate) async fn dm_expire(
