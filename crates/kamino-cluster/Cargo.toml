@@ -1,0 +1,34 @@
+[package]
+name = "kamino-cluster"
+description = "SWIM membership, routing table, replication and inter-node forwarding for Kamino."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["discovery-static", "discovery-dns"]
+discovery-static = []
+discovery-dns = []
+discovery-kubernetes = []
+discovery-consul = []
+
+[dependencies]
+kamino-core = { workspace = true }
+kamino-storage = { workspace = true }
+kamino-protocol = { workspace = true }
+kamino-observability = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }

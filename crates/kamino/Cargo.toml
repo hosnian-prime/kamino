@@ -1,0 +1,29 @@
+[package]
+name = "kamino"
+description = "Distributed in-memory cache: umbrella crate with embedded and server entry points."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+kubernetes = ["kamino-cluster/discovery-kubernetes"]
+consul = ["kamino-cluster/discovery-consul"]
+otlp = ["kamino-observability/otlp"]
+full = ["kubernetes", "consul", "otlp"]
+
+[dependencies]
+kamino-core = { workspace = true }
+kamino-storage = { workspace = true }
+kamino-protocol = { workspace = true }
+kamino-cluster = { workspace = true }
+kamino-observability = { workspace = true }
+kamino-client = { workspace = true }
+kamino-server = { workspace = true }

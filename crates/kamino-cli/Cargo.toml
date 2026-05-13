@@ -1,0 +1,26 @@
+[package]
+name = "kamino-cli"
+description = "Admin CLI for Kamino: drain, stats, scan, members, routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kamino-cli"
+path = "src/main.rs"
+
+[dependencies]
+kamino-core = { workspace = true }
+kamino-client = { workspace = true }
+kamino-protocol = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }

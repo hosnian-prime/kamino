@@ -1,0 +1,21 @@
+[package]
+name = "kamino-protocol"
+description = "RESP2/3 wire protocol codec and command AST for Kamino."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kamino-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+winnow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

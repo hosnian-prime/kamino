@@ -1,0 +1,22 @@
+[package]
+name = "kamino-client"
+description = "Client traits, RemoteClient (TCP) and EmbeddedClient for Kamino."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kamino-core = { workspace = true }
+kamino-cluster = { workspace = true }
+kamino-protocol = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
