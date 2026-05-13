@@ -14,7 +14,10 @@ workspace = true
 [dependencies]
 kamino-core = { workspace = true }
 kamino-storage = { workspace = true }
+kamino-protocol = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

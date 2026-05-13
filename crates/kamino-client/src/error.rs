@@ -66,6 +66,24 @@ pub enum Error {
     /// Invalid argument (e.g. both NX and XX set).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// The remote server is gone or closed the connection mid-flight.
+    /// Phase 2: surfaced by `RemoteClient` on TCP disconnect or queue close.
+    #[error("server is gone: {0}")]
+    ServerGone(String),
+
+    /// Wire-level protocol or transport error from `RemoteClient`.
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
+    /// Typed `-ERR <code> <msg>` error frame returned by the server.
+    #[error("server error: {0}")]
+    Server(String),
+
+    /// Authentication required by the server, or supplied credentials were
+    /// rejected.
+    #[error("auth required: {0}")]
+    Auth(String),
 }
 
 impl From<kamino_storage::Error> for Error {

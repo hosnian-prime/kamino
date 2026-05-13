@@ -644,13 +644,16 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures",
  "kamino-core",
+ "kamino-protocol",
  "kamino-storage",
  "parking_lot",
  "rand 0.8.6",
  "regex",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
