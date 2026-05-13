@@ -4,13 +4,16 @@
 //!
 //! - `check-deps`: enforce the directional dependency graph declared in
 //!   `ROADMAP.md` §3. Fails fast on any back-edge.
+//! - `schema-check`: verify the routing-table `MessagePack` encoding stays
+//!   forward-compatible (`docs/15-compatibility.md`). Delegates to the
+//!   `routing_schema_forward_compat` integration test in `kamino-cluster`.
 //!
-//! Future subcommands (per `ROADMAP.md` §5): `schema-check`, `gen-manifests`,
-//! `bench-report`, `check-metrics`.
+//! Future subcommands (per `ROADMAP.md` §5): `gen-manifests`, `bench-report`,
+//! `check-metrics`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ShellCommand, ExitCode};
 
 use clap::{Parser, Subcommand};
 
@@ -25,6 +28,8 @@ struct Cli {
 enum Command {
     /// Enforce the directional dependency graph from ROADMAP.md §3.
     CheckDeps,
+    /// Verify the routing-table `MessagePack` codec stays adds-only.
+    SchemaCheck,
 }
 
 fn main() -> ExitCode {
@@ -40,6 +45,49 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::SchemaCheck => match schema_check() {
+            Ok(()) => {
+                println!(
+                    "xtask schema-check: routing-table MessagePack codec is forward-compatible",
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("xtask schema-check failed:\n{e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema-check (delegated to a cargo test invocation)
+// ---------------------------------------------------------------------------
+
+fn schema_check() -> Result<(), String> {
+    let workspace_root = workspace_root()?;
+    let status = ShellCommand::new(env!("CARGO"))
+        .args([
+            "test",
+            "--locked",
+            "-p",
+            "kamino-cluster",
+            "--test",
+            "routing_schema_forward_compat",
+            "--",
+            "current_code_decodes_v1_fixture",
+            "--exact",
+        ])
+        .current_dir(&workspace_root)
+        .status()
+        .map_err(|e| format!("spawn cargo test: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "routing-table schema check failed (exit {})",
+            status.code().unwrap_or(-1),
+        ))
     }
 }
 

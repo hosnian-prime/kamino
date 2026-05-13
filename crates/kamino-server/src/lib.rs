@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use kamino_client::Client;
-use kamino_cluster::{Cluster, MemberProvider};
+use kamino_cluster::{Cluster, MemberProvider, RoutingProvider};
 use kamino_core::{Config, Mode};
 use rand::RngCore;
 use tokio::net::TcpListener;
@@ -101,12 +101,12 @@ impl Server {
         if config.mode != Mode::Standalone {
             return Err(ServerError::WrongMode(config.mode.as_str()));
         }
-        Self::bind_internal(config, client, None).await
+        Self::bind_internal(config, client, None, None).await
     }
 
-    /// Like [`Server::bind`] but registers `cluster` as the `MemberProvider`
-    /// so the `CLUSTER.MEMBERS` handler returns live SWIM data instead of
-    /// an empty array.
+    /// Like [`Server::bind`] but registers `cluster` as both the
+    /// `MemberProvider` (`CLUSTER.MEMBERS`) and the `RoutingProvider`
+    /// (`CLUSTER.ROUTINGTABLE`, `CLUSTER.READY`, `INTERNAL.NODE.UPDATEROUTING`).
     ///
     /// The server takes a reference-counted handle to the running cluster
     /// runtime; lifetime management remains the caller's responsibility
@@ -119,14 +119,22 @@ impl Server {
         if config.mode != Mode::Standalone {
             return Err(ServerError::WrongMode(config.mode.as_str()));
         }
-        let provider: Arc<dyn MemberProvider> = cluster;
-        Self::bind_internal(config, client, Some(provider)).await
+        let member_provider: Arc<dyn MemberProvider> = Arc::clone(&cluster) as _;
+        let routing_provider: Arc<dyn RoutingProvider> = cluster;
+        Self::bind_internal(
+            config,
+            client,
+            Some(member_provider),
+            Some(routing_provider),
+        )
+        .await
     }
 
     async fn bind_internal(
         config: &Config,
         client: Arc<dyn Client>,
         member_provider: Option<Arc<dyn MemberProvider>>,
+        routing_provider: Option<Arc<dyn RoutingProvider>>,
     ) -> Result<Self, ServerError> {
         let addr = SocketAddr::new(config.network.bind_addr, config.network.bind_port);
         let listener = TcpListener::bind(addr)
@@ -142,6 +150,7 @@ impl Server {
             version: env!("CARGO_PKG_VERSION"),
             id,
             member_provider,
+            routing_provider,
         });
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let settings = ConnSettings {

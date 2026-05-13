@@ -228,6 +228,8 @@ mod tests {
             discovery,
             clock: Arc::new(SystemClock),
             local,
+            hasher: None,
+            routing_pusher: None,
         };
         Arc::new(Cluster::assemble(deps))
     }
@@ -273,6 +275,8 @@ mod tests {
             discovery,
             clock: Arc::new(SystemClock),
             local,
+            hasher: None,
+            routing_pusher: None,
         };
         let cluster = Arc::new(Cluster::assemble(deps));
         let params = JoinParams {

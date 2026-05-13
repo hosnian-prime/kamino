@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kamino_client::Client;
-use kamino_cluster::MemberProvider;
+use kamino_cluster::{MemberProvider, RoutingProvider};
 use kamino_protocol::{Command, Frame};
 
 use crate::handlers::{self, Response};
@@ -26,6 +26,9 @@ pub(crate) struct ServerContext {
     /// cluster (Phase 2 compatibility); in that case the handler returns an
     /// empty array per `docs/06-network-protocol.md`.
     pub(crate) member_provider: Option<Arc<dyn MemberProvider>>,
+    /// Source for `CLUSTER.ROUTINGTABLE`, `CLUSTER.READY`,
+    /// `INTERNAL.NODE.UPDATEROUTING`. `None` ⇒ standalone-without-cluster.
+    pub(crate) routing_provider: Option<Arc<dyn RoutingProvider>>,
 }
 
 impl std::fmt::Debug for ServerContext {
@@ -38,6 +41,7 @@ impl std::fmt::Debug for ServerContext {
             .field("version", &self.version)
             .field("id", &self.id)
             .field("member_provider", &self.member_provider.is_some())
+            .field("routing_provider", &self.routing_provider.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -105,6 +109,16 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
         } => handlers::dm_scan(&ctx.client, &dmap, partition_id, cursor, options).await,
 
         Command::ClusterMembers => handlers::cluster_members(ctx.member_provider.as_ref()),
+        Command::ClusterRoutingTable => {
+            handlers::cluster_routing_table(ctx.routing_provider.as_ref())
+        }
+        Command::ClusterReady => handlers::cluster_ready(ctx.routing_provider.as_ref()),
+        Command::InternalNodeUpdateRouting { table } => {
+            handlers::internal_node_update_routing(ctx.routing_provider.as_ref(), &table)
+        }
+        Command::InternalNodeLengthOfPart { partition_id } => {
+            handlers::internal_node_length_of_part(partition_id)
+        }
     }
 }
 
@@ -135,6 +149,7 @@ mod tests {
             version: "0.0.0",
             id: 1,
             member_provider: None,
+            routing_provider: None,
         }
     }
 
@@ -288,6 +303,50 @@ mod tests {
             panic!("expected array");
         };
         assert!(items.is_empty(), "no provider → empty array");
+    }
+
+    #[tokio::test]
+    async fn cluster_routing_table_norent_without_provider() {
+        let ctx = ctx_no_auth();
+        let mut st = ConnState::new(false);
+        let resp = dispatch(&ctx, &mut st, Command::ClusterRoutingTable).await;
+        assert!(matches!(resp.frame, Frame::SimpleString(ref s) if s == "NORT"));
+    }
+
+    #[tokio::test]
+    async fn cluster_ready_notready_without_provider() {
+        let ctx = ctx_no_auth();
+        let mut st = ConnState::new(false);
+        let resp = dispatch(&ctx, &mut st, Command::ClusterReady).await;
+        assert!(matches!(resp.frame, Frame::Error(ref e) if e.starts_with("NOTREADY")));
+    }
+
+    #[tokio::test]
+    async fn internal_update_routing_errors_without_provider() {
+        let ctx = ctx_no_auth();
+        let mut st = ConnState::new(false);
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::InternalNodeUpdateRouting {
+                table: Bytes::from_static(b"\x80"),
+            },
+        )
+        .await;
+        assert!(matches!(resp.frame, Frame::Error(ref e) if e.starts_with("ERR")));
+    }
+
+    #[tokio::test]
+    async fn internal_length_of_part_returns_zero_for_now() {
+        let ctx = ctx_no_auth();
+        let mut st = ConnState::new(false);
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::InternalNodeLengthOfPart { partition_id: 0 },
+        )
+        .await;
+        assert!(matches!(resp.frame, Frame::Integer(0)));
     }
 
     #[test]

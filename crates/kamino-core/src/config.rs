@@ -195,6 +195,10 @@ pub struct CoreConfig {
     pub read_repair: bool,
     /// Bounded-load consistent hashing factor (Mirrokni 2016). `>= 1.0`.
     pub load_factor: f64,
+    /// Virtual nodes per physical member on the consistent-hash ring. More
+    /// virtual nodes smooth the partition distribution at the cost of routing
+    /// table memory. See `docs/02-consistent-hashing.md`.
+    pub virtual_nodes_per_member: u32,
 }
 
 impl Default for CoreConfig {
@@ -208,6 +212,7 @@ impl Default for CoreConfig {
             replication_mode: ReplicationMode::Sync,
             read_repair: false,
             load_factor: 1.25,
+            virtual_nodes_per_member: 20,
         }
     }
 }
@@ -237,6 +242,11 @@ impl CoreConfig {
         }
         if !self.load_factor.is_finite() {
             return Err(Error::Config("load_factor must be finite".into()));
+        }
+        if self.virtual_nodes_per_member == 0 {
+            return Err(Error::Config(
+                "virtual_nodes_per_member must be >= 1".into(),
+            ));
         }
         Ok(())
     }

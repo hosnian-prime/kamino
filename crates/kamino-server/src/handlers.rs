@@ -161,6 +161,60 @@ fn build_hello_response(version: &str, resp3: bool, server_id: u64) -> Frame {
     }
 }
 
+pub(crate) fn cluster_routing_table(
+    provider: Option<&Arc<dyn kamino_cluster::RoutingProvider>>,
+) -> Response {
+    // Wire shape: single bulk string carrying the MessagePack-encoded
+    // routing table, or `+NORT` (no routing table) if none has been built
+    // yet. Clients deserialise with the same `rmp-serde` named-map decoder
+    // used internally — forward-compatibility is the routing-table's
+    // contract, not the RESP framing's.
+    provider.and_then(|p| p.routing_table_bytes()).map_or_else(
+        || Response::ok(Frame::SimpleString("NORT".into())),
+        |bytes| Response::ok(Frame::Bulk(BulkString::from_bytes(Bytes::from(bytes)))),
+    )
+}
+
+pub(crate) fn cluster_ready(
+    provider: Option<&Arc<dyn kamino_cluster::RoutingProvider>>,
+) -> Response {
+    let ready = provider.is_some_and(|p| p.is_ready());
+    if ready {
+        Response::ok(Frame::ok())
+    } else {
+        Response::ok(Frame::Error("NOTREADY cluster not yet ready".into()))
+    }
+}
+
+pub(crate) fn internal_node_update_routing(
+    provider: Option<&Arc<dyn kamino_cluster::RoutingProvider>>,
+    table: &Bytes,
+) -> Response {
+    let Some(p) = provider else {
+        return Response::ok(Frame::Error(
+            "ERR cluster runtime not active on this node".into(),
+        ));
+    };
+    match p.apply_routing_update(table) {
+        Ok(kamino_cluster::ApplyRoutingOutcome::Accepted) => Response::ok(Frame::ok()),
+        Ok(kamino_cluster::ApplyRoutingOutcome::Stale) => {
+            Response::ok(Frame::SimpleString("STALE".into()))
+        }
+        Ok(kamino_cluster::ApplyRoutingOutcome::UnsupportedSchema) => {
+            Response::ok(Frame::SimpleString("SCHEMA".into()))
+        }
+        Err(e) => Response::ok(Frame::Error(format!("ERR routing decode: {e}"))),
+    }
+}
+
+pub(crate) const fn internal_node_length_of_part(_partition_id: u32) -> Response {
+    // Phase 4A: the storage engine isn't partition-aware yet, so the
+    // count is always 0. The wire shape is locked in now so peers using
+    // `INTERNAL.NODE.LENGTHOFPART` for balancer planning (Phase 6) need
+    // no parser changes.
+    Response::ok(Frame::Integer(0))
+}
+
 pub(crate) fn cluster_members(
     provider: Option<&Arc<dyn kamino_cluster::MemberProvider>>,
 ) -> Response {

@@ -62,6 +62,8 @@ async fn build_single_node_cluster() -> Arc<Cluster> {
         discovery,
         clock: Arc::new(SystemClock),
         local: member,
+        hasher: None,
+        routing_pusher: None,
     };
     Cluster::bootstrap(deps).await.expect("cluster bootstrap")
 }
