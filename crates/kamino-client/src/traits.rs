@@ -85,4 +85,17 @@ pub trait Client: Send + Sync + std::fmt::Debug {
     async fn clear_partition(&self, _dmap: &str, _partition_id: u32) -> Result<u32> {
         Err(Error::Unsupported("clear_partition"))
     }
+
+    /// Sweep storage for fragments emptied by recent `clear_partition`
+    /// calls. The Phase 6 single-fragment-per-DMap storage handles this
+    /// by running `StorageEngine::compact()` on every registered DMap —
+    /// reclaiming deleted-entry bytes after a migration round. Returns
+    /// the total bytes reclaimed across all dmaps.
+    ///
+    /// Phase 6 — `routing.check_empty_fragments_interval` periodic
+    /// sweep. The default impl is a no-op (remote clients have no local
+    /// storage to compact).
+    async fn cleanup_empty_fragments(&self) -> Result<usize> {
+        Ok(0)
+    }
 }

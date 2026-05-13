@@ -42,10 +42,11 @@ pub mod transport;
 
 pub use balancer::{
     BalancerParams, ClusterEvent, ClusterEventsSink, ForwarderTransport, MigrationSource,
-    MigrationTransport, TracingEventsSink, run_balancer_loop, run_tick,
+    MigrationTransport, OrphanSink, TracingEventsSink, run_balancer_loop, run_tick,
 };
 pub use cluster::{
-    Cluster, ClusterDeps, MemberProvider, MemberSummary, ReplicationSettings, RoutingProvider,
+    Cluster, ClusterDeps, FragmentCleaner, MemberProvider, MemberSummary, ReplicationSettings,
+    RoutingProvider,
 };
 #[cfg(feature = "discovery-dns")]
 pub use discovery::DnsDiscovery;

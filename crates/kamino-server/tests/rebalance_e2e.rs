@@ -407,6 +407,7 @@ async fn cluster_growth_migrates_partition_to_new_primary() {
         trigger_interval: Duration::from_secs(15),
         cancel: tokio_util::sync::CancellationToken::new(),
         events: Arc::clone(&events) as Arc<dyn ClusterEventsSink>,
+        orphan_sink: None,
     };
 
     // Drive a single balancer tick.
@@ -568,6 +569,7 @@ async fn balancer_idempotent_under_repeated_ticks() {
         trigger_interval: Duration::from_secs(15),
         cancel: tokio_util::sync::CancellationToken::new(),
         events: Arc::clone(&events) as Arc<dyn ClusterEventsSink>,
+        orphan_sink: None,
     };
 
     for _ in 0..5 {

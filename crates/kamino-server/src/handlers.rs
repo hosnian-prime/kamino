@@ -215,16 +215,30 @@ pub(crate) fn internal_node_update_routing(
             "ERR cluster runtime not active on this node".into(),
         ));
     };
-    match p.apply_routing_update(table) {
-        Ok(kamino_cluster::ApplyRoutingOutcome::Accepted) => Response::ok(Frame::ok()),
-        Ok(kamino_cluster::ApplyRoutingOutcome::Stale) => {
-            Response::ok(Frame::SimpleString("STALE".into()))
-        }
-        Ok(kamino_cluster::ApplyRoutingOutcome::UnsupportedSchema) => {
-            Response::ok(Frame::SimpleString("SCHEMA".into()))
-        }
-        Err(e) => Response::ok(Frame::Error(format!("ERR routing decode: {e}"))),
+    let status = match p.apply_routing_update(table) {
+        Ok(kamino_cluster::ApplyRoutingOutcome::Accepted) => "OK",
+        Ok(kamino_cluster::ApplyRoutingOutcome::Stale) => "STALE",
+        Ok(kamino_cluster::ApplyRoutingOutcome::UnsupportedSchema) => "SCHEMA",
+        Err(e) => return Response::ok(Frame::Error(format!("ERR routing decode: {e}"))),
+    };
+    // Phase 6 — `docs/12-failure-handling.md` "Left-Over Data Reports":
+    // the receiver piggybacks its current orphan list onto the routing-
+    // table-push reply. The coordinator (or any caller) parses the
+    // second array element; legacy callers that only inspect the first
+    // element keep working because RESP arrays are unambiguous on the
+    // wire.
+    let orphans = p.local_orphans();
+    let mut orphan_frames: Vec<Frame> = Vec::with_capacity(orphans.len());
+    for (part, dmap) in orphans {
+        orphan_frames.push(Frame::Array(Some(vec![
+            Frame::Integer(i64::from(part)),
+            Frame::Bulk(BulkString::from(dmap.as_bytes())),
+        ])));
     }
+    Response::ok(Frame::Array(Some(vec![
+        Frame::SimpleString(status.into()),
+        Frame::Array(Some(orphan_frames)),
+    ])))
 }
 
 pub(crate) const fn internal_node_length_of_part(_partition_id: u32) -> Response {
@@ -531,7 +545,16 @@ pub(crate) async fn dm_get(
     }
 
     let backups = routing.backup_addrs_for_key(dmap, key);
-    if backups.is_empty() {
+    // Phase 6: when read_repair is on, the read fan-out also covers any
+    // previous owners listed in the fragmented-partition window. This
+    // matches docs/12-failure-handling.md "Read Repair":
+    //   "Every GET reads from primary + backups + previous owners".
+    let prior_for_repair: Vec<std::net::SocketAddr> = if settings.read_repair {
+        routing.previous_owners_for_key(dmap, key)
+    } else {
+        Vec::new()
+    };
+    if backups.is_empty() && prior_for_repair.is_empty() {
         return local.map_or_else(
             || Response::ok(Frame::Bulk(BulkString::null())),
             |r| Response::ok(Frame::Bulk(BulkString::from(r.value))),
@@ -542,6 +565,14 @@ pub(crate) async fn dm_get(
     // pair (or None on transport failure) feeds the LWW reducer below.
     let mut replies =
         replication::read_from_backups(routing, &backups, dmap.clone(), key.clone()).await;
+    // Append (value, ts) from each previous owner, when read_repair is on,
+    // so the LWW reducer also picks up a stranded-on-old-primary write.
+    if !prior_for_repair.is_empty() {
+        let prior_replies =
+            replication::read_from_backups(routing, &prior_for_repair, dmap.clone(), key.clone())
+                .await;
+        replies.extend(prior_replies);
+    }
     // Push the primary's local read into the same shape.
     replies.push(local.map(|r| (r.value, r.timestamp)));
 
@@ -552,10 +583,18 @@ pub(crate) async fn dm_get(
 
     if settings.read_repair {
         // Propagate the winner to every replica whose stamp is strictly
-        // lower (or whose copy is missing entirely). Use the existing
-        // primary-side LWW path: a DM.PUT with TS=winner_ts goes through
-        // the receiver's internode dispatch and lands in `put_lww`.
-        let stale_peers = stale_replicas(&backups, &replies, winner_ts);
+        // lower (or whose copy is missing entirely). The repair targets
+        // include both the current backups and any surviving previous
+        // owners — the latter so a stale fragmented-partition copy is
+        // brought up to date even before the balancer migrates it.
+        let backup_replies = &replies[..backups.len()];
+        let prior_replies = if prior_for_repair.is_empty() {
+            &[][..]
+        } else {
+            &replies[backups.len()..backups.len() + prior_for_repair.len()]
+        };
+        let mut stale_peers = stale_replicas(&backups, backup_replies, winner_ts);
+        stale_peers.extend(stale_replicas(&prior_for_repair, prior_replies, winner_ts));
         if !stale_peers.is_empty() {
             ts_source.observe(winner_ts);
             let opts = kamino_protocol::PutCommandOptions {
@@ -650,10 +689,11 @@ pub(crate) async fn internal_node_get_with_ts(
 /// Handler for `INTERNAL.NODE.MOVEFRAGMENT`. The balancer on the previous
 /// owner exports a `(dmap, partition_id)` shard and ships it here; we
 /// LWW-merge into local storage and reply `+OK` (or `-ERR <reason>` on
-/// decode / merge failure). Phase 6 — `docs/12-failure-handling.md`
-/// "Ownership Transfer Protocol".
+/// decode / merge / ownership failure). Phase 6 —
+/// `docs/12-failure-handling.md` "Ownership Transfer Protocol" steps 4–7.
 pub(crate) async fn internal_node_move_fragment(
     client: &Arc<dyn Client>,
+    routing: Option<&Arc<dyn RoutingProvider>>,
     partition_id: u32,
     partition_type: kamino_protocol::PartitionType,
     dmap: &Bytes,
@@ -668,6 +708,20 @@ pub(crate) async fn internal_node_move_fragment(
             "ERR MOVEFRAGMENT backup-type migrations are not supported in this version".into(),
         ));
     }
+    // Step 4 of the Ownership Transfer Protocol: receiver verifies that
+    // its current routing table actually maps this partition to itself.
+    // Without this check a stale sender could push data onto a peer that
+    // no longer owns the partition — leaving "twice-orphaned" data that
+    // the future balancer would have to migrate again. The check is
+    // best-effort (no provider → accept; single-node deployments have no
+    // routing table to consult).
+    if let Some(routing) = routing {
+        if !routing.owns_partition(partition_id) {
+            return Response::ok(Frame::Error(format!(
+                "MIGRATION not_owner partition {partition_id}",
+            )));
+        }
+    }
     let dmap_name = match key_str(dmap) {
         Ok(s) => s.to_string(),
         Err(f) => return Response::ok(f),
@@ -677,10 +731,14 @@ pub(crate) async fn internal_node_move_fragment(
         .await
     {
         Ok(applied) => {
+            // Step 7: publish `FragmentReceivedEvent`. Phase 6 routes
+            // events through `tracing` for now; Phase 7 swaps in the
+            // real `cluster.events` pub/sub channel once it lands.
             tracing::info!(
                 dmap = %dmap_name,
                 partition_id,
                 applied,
+                event = "fragment-received",
                 "INTERNAL.NODE.MOVEFRAGMENT accepted",
             );
             Response::ok(Frame::ok())

@@ -191,7 +191,36 @@ impl RoutingPusher for Forwarder {
             table: bytes::Bytes::copy_from_slice(table_bytes),
         };
         match self.send(target, cmd).await {
+            // Phase 4-era plain `+OK/+STALE/+SCHEMA` reply (kept for
+            // forward-compat with peers running pre-Phase 6 builds).
             Ok(Frame::SimpleString(s)) if s == "OK" || s == "STALE" || s == "SCHEMA" => Ok(()),
+            // Phase 6 reply shape: `[status, [orphans...]]` — see
+            // `docs/12-failure-handling.md` "Left-Over Data Reports".
+            Ok(Frame::Array(Some(items))) if items.len() == 2 => {
+                let status_ok = matches!(
+                    &items[0],
+                    Frame::SimpleString(s) if s == "OK" || s == "STALE" || s == "SCHEMA"
+                );
+                if !status_ok {
+                    return Err(ClusterError::Codec(format!(
+                        "unexpected routing-push status: {:?}",
+                        items[0],
+                    )));
+                }
+                // Surface orphan diagnostics to the operator at debug level
+                // for now; coordinator-directed migration on top of these
+                // reports lands in Phase 11 production hardening.
+                if let Frame::Array(Some(orphans)) = &items[1] {
+                    if !orphans.is_empty() {
+                        tracing::debug!(
+                            target = %target,
+                            orphan_count = orphans.len(),
+                            "peer reported orphaned partitions",
+                        );
+                    }
+                }
+                Ok(())
+            }
             Ok(Frame::Error(e)) => Err(ClusterError::Codec(format!(
                 "peer rejected routing push: {e}",
             ))),

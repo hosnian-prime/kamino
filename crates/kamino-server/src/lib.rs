@@ -125,10 +125,15 @@ impl Server {
         // Phase 6: hand the cluster a `MigrationSource` so its balancer loop
         // can drive `INTERNAL.NODE.MOVEFRAGMENT` against this server's
         // storage. The cluster owns the JoinHandle and the cancel token.
-        let source: Arc<dyn kamino_cluster::MigrationSource> = Arc::new(
-            crate::replication::ClientMigrationSource::new(Arc::clone(&client)),
-        );
+        let migration_adapter = Arc::new(crate::replication::ClientMigrationSource::new(
+            Arc::clone(&client),
+        ));
+        let source: Arc<dyn kamino_cluster::MigrationSource> =
+            Arc::clone(&migration_adapter) as Arc<dyn kamino_cluster::MigrationSource>;
+        let cleaner: Arc<dyn kamino_cluster::FragmentCleaner> =
+            Arc::clone(&migration_adapter) as Arc<dyn kamino_cluster::FragmentCleaner>;
         cluster.spawn_balancer(source, None);
+        cluster.spawn_fragment_cleanup(cleaner);
         Self::bind_internal(
             config,
             client,

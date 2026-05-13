@@ -18,7 +18,9 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use kamino_client::Client;
-use kamino_cluster::{ClusterError, ClusterResult, MigrationSource, RoutingProvider};
+use kamino_cluster::{
+    ClusterError, ClusterResult, FragmentCleaner, MigrationSource, RoutingProvider,
+};
 use kamino_protocol::{Command, Frame, PutCommandOptions};
 use tracing::warn;
 
@@ -297,6 +299,16 @@ impl MigrationSource for ClientMigrationSource {
     async fn clear_partition(&self, dmap: &str, partition_id: u32) -> ClusterResult<u32> {
         self.client
             .clear_partition(dmap, partition_id)
+            .await
+            .map_err(|e| into_cluster_err(&e))
+    }
+}
+
+#[async_trait::async_trait]
+impl FragmentCleaner for ClientMigrationSource {
+    async fn cleanup_empty_fragments(&self) -> ClusterResult<usize> {
+        self.client
+            .cleanup_empty_fragments()
             .await
             .map_err(|e| into_cluster_err(&e))
     }

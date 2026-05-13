@@ -206,6 +206,7 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
         } => {
             handlers::internal_node_move_fragment(
                 &ctx.client,
+                ctx.routing_provider.as_ref(),
                 partition_id,
                 partition_type,
                 &dmap,
@@ -760,14 +761,17 @@ mod tests {
             },
         )
         .await;
-        // StubRouter says `Ok(Accepted)` so the handler returns +OK. The
-        // key assertion is the *absence* of NOPERM — i.e. the cluster-
-        // secret gate let us through.
+        // Phase 6 reply shape: `[+OK, [orphans...]]`. The key assertion is
+        // the *absence* of NOPERM — i.e. the cluster-secret gate let us
+        // through.
         match resp.frame {
             Frame::Error(ref m) => {
                 assert!(!m.starts_with("NOPERM"), "expected non-NOPERM, got {m:?}");
             }
-            Frame::SimpleString(_) => {} // accepted
+            Frame::Array(Some(ref items)) if items.len() == 2 => {
+                assert!(matches!(&items[0], Frame::SimpleString(s) if s == "OK"));
+            }
+            Frame::SimpleString(_) => {} // legacy shape — also accepted
             other => panic!("unexpected reply: {other:?}"),
         }
     }

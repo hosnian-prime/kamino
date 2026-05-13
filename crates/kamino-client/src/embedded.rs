@@ -203,6 +203,18 @@ impl Client for EmbeddedClient {
         Ok(applied)
     }
 
+    async fn cleanup_empty_fragments(&self) -> Result<usize> {
+        let mut total = 0_usize;
+        for handle in self.registered_dmaps() {
+            // `Fragment::compact` reclaims garbage only when the per-table
+            // garbage_ratio crosses `max_garbage_ratio`; calling it on a
+            // pristine DMap is a cheap no-op.
+            let reclaimed = handle.fragment.compact().await?;
+            total += reclaimed;
+        }
+        Ok(total)
+    }
+
     async fn clear_partition(&self, dmap: &str, partition_id: u32) -> Result<u32> {
         let Some(handle) = self.dmaps.read().get(dmap).cloned() else {
             return Ok(0);

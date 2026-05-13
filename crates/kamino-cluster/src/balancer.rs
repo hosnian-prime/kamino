@@ -147,6 +147,24 @@ pub struct BalancerParams {
     /// Phase 6 ships a `tracing::info!` adapter; Phase 7 will route to the
     /// `cluster.events` pub/sub channel when the pub/sub service lands.
     pub events: Arc<dyn ClusterEventsSink>,
+    /// Optional sink for the current orphan list (`(partition_id, dmap)`
+    /// pairs the local node still holds but no longer owns per the routing
+    /// table). The Cluster runtime wires this to its in-memory cache so
+    /// the next `INTERNAL.NODE.UPDATEROUTING` reply can piggyback a
+    /// `LeftOverDataReport` per `docs/12-failure-handling.md`. `None`
+    /// turns the report off (tests that don't exercise it).
+    pub orphan_sink: Option<Arc<dyn OrphanSink>>,
+}
+
+/// Phase 6 `LeftOverDataReport` sink. The balancer calls
+/// [`Self::record_orphans`] at the end of every tick with the snapshot of
+/// `(partition_id, dmap)` pairs that are currently mapped to a different
+/// primary in the routing table.
+///
+/// Object-safe by design; no `Debug` bound so the `Cluster` runtime (which
+/// holds non-`Debug` `dyn` members) can self-implement directly.
+pub trait OrphanSink: Send + Sync {
+    fn record_orphans(&self, orphans: Vec<(u32, String)>);
 }
 
 /// Sink for cluster-event publication. Phase 6 only ships fragment
@@ -251,11 +269,17 @@ pub async fn run_balancer_loop(params: BalancerParams) {
 pub async fn run_tick(params: &BalancerParams) -> ClusterResult<()> {
     let Some(snapshot) = params.store.snapshot() else {
         trace!("balancer: no routing table; skipping");
+        if let Some(sink) = &params.orphan_sink {
+            sink.record_orphans(Vec::new());
+        }
         return Ok(());
     };
     let local = params.source.local_partitions().await?;
     if local.is_empty() {
         trace!("balancer: no local partitions; nothing to do");
+        if let Some(sink) = &params.orphan_sink {
+            sink.record_orphans(Vec::new());
+        }
         return Ok(());
     }
 
@@ -263,6 +287,7 @@ pub async fn run_tick(params: &BalancerParams) -> ClusterResult<()> {
     // be observed as a single migration burst in the logs / tracing.
     let mut planned: Vec<MigrationPlan> = Vec::new();
     let mut seen_dmaps: HashSet<&String> = HashSet::new();
+    let mut orphans: Vec<(u32, String)> = Vec::new();
     for (dmap, partition_id) in &local {
         seen_dmaps.insert(dmap);
         let Some(primary) = snapshot.primary_for(*partition_id) else {
@@ -272,11 +297,18 @@ pub async fn run_tick(params: &BalancerParams) -> ClusterResult<()> {
         if primary.id == params.local_id {
             continue;
         }
+        orphans.push((*partition_id, dmap.clone()));
         planned.push(MigrationPlan {
             dmap: dmap.clone(),
             partition_id: *partition_id,
             peer: primary.addr,
         });
+    }
+    // Refresh the LeftOverDataReport cache even when nothing is migrated
+    // this tick — so a peer that polls UPDATEROUTING sees an up-to-date
+    // empty list once the balancer has fully drained.
+    if let Some(sink) = &params.orphan_sink {
+        sink.record_orphans(orphans);
     }
     if planned.is_empty() {
         trace!(
@@ -463,6 +495,7 @@ mod tests {
             trigger_interval: Duration::from_secs(15),
             cancel: CancellationToken::new(),
             events: Arc::new(NullEvents),
+            orphan_sink: None,
         }
     }
 
@@ -608,6 +641,7 @@ mod tests {
             trigger_interval: Duration::from_secs(15),
             cancel: CancellationToken::new(),
             events: Arc::new(NullEvents),
+            orphan_sink: None,
         };
         // Replace the source's local_partitions reply path so the orphan
         // detection still fires for `part`.
@@ -616,5 +650,121 @@ mod tests {
         run_tick(&p).await.unwrap();
         assert!(transport.sent.lock().unwrap().is_empty());
         assert!(!*source.cleared.lock().unwrap());
+    }
+
+    /// ROADMAP §6 Phase 6 acceptance #3: "Property test: under random
+    /// join/leave sequences, eventual convergence to a balanced state."
+    ///
+    /// We model the property at the balancer layer: random sequences of
+    /// `(routing_change, balancer_tick)` events must drive every "this
+    /// node holds orphans" state back to "no orphans remain" within a
+    /// bounded number of ticks. The MigrationSource stub simulates
+    /// shrinking-then-clearing storage: every successful clear_partition
+    /// drops the corresponding entry from the local set.
+    #[tokio::test]
+    async fn property_random_join_leave_converges() {
+        use std::sync::atomic::AtomicU64;
+
+        const PARTITION_COUNT: u32 = 8;
+
+        #[derive(Debug, Default)]
+        struct ShrinkSource {
+            local: Mutex<Vec<(String, u32)>>,
+            clears: AtomicU64,
+        }
+        #[async_trait]
+        impl MigrationSource for ShrinkSource {
+            async fn local_partitions(&self) -> ClusterResult<Vec<(String, u32)>> {
+                Ok(self.local.lock().unwrap().clone())
+            }
+            async fn export_partition(&self, _dmap: &str, part: u32) -> ClusterResult<Vec<u8>> {
+                // 32-byte dummy entry — payload > 9 byte header so
+                // balancer doesn't short-circuit on the empty-fragment
+                // check.
+                let mut buf = vec![0x01_u8];
+                buf.extend_from_slice(&part.to_le_bytes());
+                buf.extend_from_slice(&1_u32.to_le_bytes());
+                buf.extend_from_slice(&[0_u8; 32]);
+                Ok(buf)
+            }
+            async fn clear_partition(&self, dmap: &str, part: u32) -> ClusterResult<u32> {
+                self.clears
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                self.local
+                    .lock()
+                    .unwrap()
+                    .retain(|(d, p)| !(d == dmap && *p == part));
+                Ok(1)
+            }
+        }
+
+        // Seed: 100 random join/leave sequences. Each sequence:
+        //   1. Pick a random topology (1..=4 members).
+        //   2. Pre-populate local data for partitions some other member
+        //      will own under that topology.
+        //   3. Run up to 5 ticks. Assert: local set is empty by the end.
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0x00C0_FFEE_C0DE);
+        for seq in 0..100 {
+            let topology_size = rng.gen_range(1..=4_u32);
+            let members: Vec<Member> = (1..=topology_size)
+                .map(|i| {
+                    let port_offset = u16::try_from(i).unwrap_or(0);
+                    mk_member(u64::from(i), u64::from(i) * 100, 3320 + 2 * port_offset)
+                })
+                .collect();
+            let store = store_with_table(members.clone(), 1);
+
+            // Pick partitions assigned to "not me" under this topology.
+            let me = members.first().unwrap();
+            let snap = store.snapshot().expect("table populated");
+            let mut orphans: Vec<(String, u32)> = Vec::new();
+            for p in 0..PARTITION_COUNT {
+                if snap.primary_for(p).map(|m| m.id) != Some(me.id) {
+                    orphans.push(("dm".into(), p));
+                }
+            }
+            if orphans.is_empty() {
+                // Single-node topology — nothing to migrate, skip.
+                continue;
+            }
+
+            let source = Arc::new(ShrinkSource {
+                local: Mutex::new(orphans.clone()),
+                ..Default::default()
+            });
+            let transport = Arc::new(StubTransport::default());
+            let p = BalancerParams {
+                local_id: me.id,
+                store: Arc::clone(&store),
+                source: Arc::clone(&source) as Arc<dyn MigrationSource>,
+                transport: Arc::clone(&transport) as Arc<dyn MigrationTransport>,
+                trigger_interval: Duration::from_secs(15),
+                cancel: CancellationToken::new(),
+                events: Arc::new(NullEvents),
+                orphan_sink: None,
+            };
+
+            // Run up to 5 ticks (way over the doc-stated "2 cycles" bound).
+            for _ in 0..5 {
+                run_tick(&p).await.unwrap();
+                if source.local.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                source.local.lock().unwrap().is_empty(),
+                "sequence {seq}: failed to converge — leftover {:?}",
+                source.local.lock().unwrap()
+            );
+            // Every orphan must have hit clear_partition exactly once.
+            let cleared = usize::try_from(source.clears.load(std::sync::atomic::Ordering::Acquire))
+                .unwrap_or(usize::MAX);
+            assert_eq!(
+                cleared,
+                orphans.len(),
+                "sequence {seq}: clear count must equal orphan count",
+            );
+        }
     }
 }
