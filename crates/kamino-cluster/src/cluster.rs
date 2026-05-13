@@ -27,6 +27,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::balancer::{
+    BalancerParams, ClusterEventsSink, ForwarderTransport, MigrationSource, MigrationTransport,
+    OrphanSink, TracingEventsSink, run_balancer_loop,
+};
 use crate::discovery::DiscoveryPlugin;
 use crate::error::{ClusterError, ClusterResult};
 use crate::forwarder::{Forwarder, ForwarderConfig};
@@ -86,6 +90,11 @@ pub struct Cluster {
     routing_config: kamino_core::config::RoutingConfig,
     network_config: kamino_core::config::NetworkConfig,
     member_count_quorum: u32,
+    balancer_trigger_interval: std::time::Duration,
+    /// Phase 6 `LeftOverDataReport` cache, refreshed by the balancer loop
+    /// on every tick. `local_orphans()` returns a clone of this so the
+    /// handler stays synchronous.
+    orphan_cache: Mutex<Vec<(u32, String)>>,
 }
 
 impl Cluster {
@@ -135,7 +144,16 @@ impl Cluster {
             routing_config: deps.config.routing.clone(),
             network_config: deps.config.network.clone(),
             member_count_quorum: deps.config.core.member_count_quorum,
+            balancer_trigger_interval: deps.config.balancer.trigger_interval,
+            orphan_cache: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Update the cached orphan list. Called by the balancer loop every
+    /// tick — the handler reads from this cache to fill the
+    /// `LeftOverDataReport` field of `INTERNAL.NODE.UPDATEROUTING` replies.
+    pub fn record_orphans(&self, orphans: Vec<(u32, String)>) {
+        *self.orphan_cache.lock() = orphans;
     }
 
     /// Underlying inter-node forwarder if one was created by
@@ -305,6 +323,86 @@ impl Cluster {
         Arc::clone(&self.transport)
     }
 
+    /// Spawn the Phase 6 balancer loop. The server runtime owns the
+    /// `MigrationSource` (which knows how to scan local storage) and
+    /// optionally a custom `events` sink — defaults to a tracing-only
+    /// adapter.
+    ///
+    /// Returns silently if no forwarder is available (test deployments
+    /// that wire a custom `RoutingPusher` and skip the real one): the
+    /// balancer can't migrate without a transport. Tests that need to
+    /// drive the balancer manually call [`crate::run_tick`] directly.
+    pub fn spawn_balancer(
+        self: &Arc<Self>,
+        source: Arc<dyn MigrationSource>,
+        events: Option<Arc<dyn ClusterEventsSink>>,
+    ) {
+        let Some(fwd) = self.forwarder.clone() else {
+            debug!("no forwarder available; balancer loop will not run");
+            return;
+        };
+        let transport: Arc<dyn MigrationTransport> = Arc::new(ForwarderTransport::new(fwd));
+        let events: Arc<dyn ClusterEventsSink> =
+            events.unwrap_or_else(|| Arc::new(TracingEventsSink));
+        let orphan_sink: Arc<dyn OrphanSink> = Arc::clone(self) as Arc<dyn OrphanSink>;
+        let params = BalancerParams {
+            local_id: self.local_id,
+            store: Arc::clone(&self.routing_store),
+            source,
+            transport,
+            trigger_interval: self.balancer_trigger_interval,
+            cancel: self.cancel.clone(),
+            events,
+            orphan_sink: Some(orphan_sink),
+        };
+        let handle = tokio::spawn(async move {
+            run_balancer_loop(params).await;
+        });
+        self.tasks.lock().push(handle);
+        debug!("balancer loop spawned");
+    }
+
+    /// Spawn the Phase 6 empty-fragment cleanup loop. Wakes up every
+    /// `routing.check_empty_fragments_interval` and calls
+    /// `Client::cleanup_empty_fragments` to reclaim bytes left behind by
+    /// the balancer's `clear_partition` calls. Defaults to a no-op for
+    /// engines without garbage (`RamBlock` reclaims tables whose
+    /// `garbage_ratio` crosses the threshold).
+    pub fn spawn_fragment_cleanup(self: &Arc<Self>, cleaner: Arc<dyn FragmentCleaner>) {
+        let interval = self.routing_config.check_empty_fragments_interval;
+        let cancel = self.cancel.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate first-tick; production deployments expect
+            // a full interval before the first sweep.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    _ = ticker.tick() => {}
+                }
+                match cleaner.cleanup_empty_fragments().await {
+                    Ok(reclaimed) if reclaimed > 0 => {
+                        info!(reclaimed_bytes = reclaimed, "empty-fragment cleanup");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(error = %e, "empty-fragment cleanup failed; will retry");
+                    }
+                }
+            }
+        });
+        self.tasks.lock().push(handle);
+        debug!(?interval, "fragment cleanup loop spawned");
+    }
+
+    /// `[balancer]` trigger interval (for tests + diagnostics).
+    #[must_use]
+    pub const fn balancer_trigger_interval(&self) -> std::time::Duration {
+        self.balancer_trigger_interval
+    }
+
     /// Discovery plugin handle.
     #[must_use]
     pub fn discovery(&self) -> Arc<dyn DiscoveryPlugin> {
@@ -469,6 +567,21 @@ impl MemberProvider for Cluster {
     }
 }
 
+impl OrphanSink for Cluster {
+    fn record_orphans(&self, orphans: Vec<(u32, String)>) {
+        Self::record_orphans(self, orphans);
+    }
+}
+
+/// Storage seam for the Phase 6 empty-fragment cleanup loop. The server
+/// runtime implements this with a thin `Arc<dyn Client>` wrapper so the
+/// cluster crate stays decoupled from the client trait.
+#[async_trait::async_trait]
+pub trait FragmentCleaner: Send + Sync {
+    /// Returns total bytes reclaimed across all local fragments.
+    async fn cleanup_empty_fragments(&self) -> ClusterResult<usize>;
+}
+
 /// Replication tuning surfaced to the RESP server. Mirrors the relevant
 /// `[core]` knobs from `kamino-core::config::CoreConfig` so the server
 /// can enforce write/read quorum at the op boundary without re-reading
@@ -519,6 +632,42 @@ pub trait RoutingProvider: Send + Sync {
     ///
     /// Phase 5 — `docs/04-replication.md` "Backup Owner Selection".
     fn backup_addrs_for_key(&self, _dmap_name: &[u8], _key: &[u8]) -> Vec<SocketAddr> {
+        Vec::new()
+    }
+
+    /// Previous owners for the partition holding `(dmap, key)` — every
+    /// entry in `RoutingTable::primary[part]` after index 0. Used by the
+    /// Phase 6 fragmented-partition read path: after a topology change,
+    /// reads on the new primary fall back to previous owners until the
+    /// balancer migrates the data. Returns an empty vec for non-fragmented
+    /// partitions or when this node isn't on the primary side.
+    ///
+    /// Phase 6 — `docs/12-failure-handling.md` "Behavior During Fragmentation".
+    fn previous_owners_for_key(&self, _dmap_name: &[u8], _key: &[u8]) -> Vec<SocketAddr> {
+        Vec::new()
+    }
+
+    /// Whether the local node currently owns `partition_id` per the
+    /// applied routing table (either as the current primary at
+    /// `primary[part][0]` or as one of the prior owners during a
+    /// fragmented transition). Used by the Phase 6 MOVEFRAGMENT receiver
+    /// to refuse imports against partitions the table doesn't actually
+    /// map to us — defends against stale-routing senders.
+    ///
+    /// Default `true` keeps Phase 4/5 tests that pass a minimal
+    /// `RoutingProvider` working without touching every stub.
+    fn owns_partition(&self, _partition_id: u32) -> bool {
+        true
+    }
+
+    /// Local orphans — `(partition_id, dmap_name)` pairs that this node
+    /// holds but the *current* routing table says it no longer owns. Used
+    /// by the Phase 6 `LeftOverDataReport` piggyback on
+    /// `INTERNAL.NODE.UPDATEROUTING` replies so the coordinator (or any
+    /// caller) can see which migrations are pending.
+    ///
+    /// Default empty so non-cluster tests skip the surface entirely.
+    fn local_orphans(&self) -> Vec<(u32, String)> {
         Vec::new()
     }
 
@@ -645,6 +794,41 @@ impl RoutingProvider for Cluster {
             return Vec::new();
         }
         snap.backups_for(part).iter().map(|m| m.addr).collect()
+    }
+
+    fn previous_owners_for_key(&self, dmap_name: &[u8], key: &[u8]) -> Vec<SocketAddr> {
+        let Some(snap) = self.routing_store.snapshot() else {
+            return Vec::new();
+        };
+        let part = crate::routing::partition_for(
+            self.hasher.as_ref(),
+            dmap_name,
+            key,
+            self.core_config.partition_count,
+        );
+        let owners = snap.owners_for(part);
+        // Index 0 is the current primary; the rest are prior owners from a
+        // recent topology transition. Only emit the prior list when this
+        // node is itself the current primary — non-primaries hit MOVED, not
+        // a fragmented-read path.
+        if owners.first().map(|m| m.id) != Some(self.local_id) {
+            return Vec::new();
+        }
+        owners.iter().skip(1).map(|m| m.addr).collect()
+    }
+
+    fn owns_partition(&self, partition_id: u32) -> bool {
+        let Some(snap) = self.routing_store.snapshot() else {
+            // No routing table yet → accept (single-node bootstrap path).
+            return true;
+        };
+        snap.owners_for(partition_id)
+            .iter()
+            .any(|m| m.id == self.local_id)
+    }
+
+    fn local_orphans(&self) -> Vec<(u32, String)> {
+        self.orphan_cache.lock().clone()
     }
 
     fn member_quorum_satisfied(&self) -> bool {

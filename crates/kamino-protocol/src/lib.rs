@@ -24,7 +24,7 @@ pub mod frame;
 pub mod hello;
 
 pub use codec::{ProtocolVersion, RespCodec};
-pub use command::{Command, PutCommandOptions, ScanCommandOptions};
+pub use command::{Command, PartitionType, PutCommandOptions, ScanCommandOptions};
 pub use error::{CommandError, ProtocolError};
 pub use frame::{BulkString, Frame};
 pub use hello::HelloArgs;

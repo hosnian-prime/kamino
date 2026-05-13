@@ -43,4 +43,59 @@ pub trait Client: Send + Sync + std::fmt::Debug {
     async fn refresh_metadata(&self) -> Result<()> {
         Err(Error::Unsupported("refresh_metadata"))
     }
+
+    // ---- Phase 6 fragment migration -------------------------------------------------------
+
+    /// `(dmap_name, partition_id)` pairs that currently hold at least one live
+    /// entry on this node. The balancer (see [`kamino-cluster`'s] balancer
+    /// loop) calls this to enumerate candidate orphans on each tick.
+    ///
+    /// Default: empty. The embedded backend overrides with a scan-and-bucket
+    /// pass; remote-side clients have no notion of "local storage" and return
+    /// empty.
+    async fn local_partitions(&self) -> Result<Vec<(String, u32)>> {
+        Ok(Vec::new())
+    }
+
+    /// Serialise every live entry in `dmap` whose key hashes into
+    /// `partition_id` for migration. The wire shape is the
+    /// `FragmentPayloadV1` codec defined in this crate's `migration`
+    /// module — opaque to the caller; only [`Self::import_partition`] on a
+    /// peer should decode it.
+    async fn export_partition(&self, _dmap: &str, _partition_id: u32) -> Result<Vec<u8>> {
+        Err(Error::Unsupported("export_partition"))
+    }
+
+    /// LWW-merge the payload produced by [`Self::export_partition`] into local
+    /// storage under `(dmap, partition_id)`. Returns the number of entries
+    /// that won the merge (`existing.ts < incoming.ts` or no existing entry).
+    async fn import_partition(
+        &self,
+        _dmap: &str,
+        _partition_id: u32,
+        _payload: &[u8],
+    ) -> Result<u32> {
+        Err(Error::Unsupported("import_partition"))
+    }
+
+    /// Delete every live entry in `dmap` whose key hashes into `partition_id`.
+    /// The balancer calls this after a successful
+    /// [`Self::export_partition`] + remote `INTERNAL.NODE.MOVEFRAGMENT` round
+    /// to clear the orphan locally. Returns the number of entries removed.
+    async fn clear_partition(&self, _dmap: &str, _partition_id: u32) -> Result<u32> {
+        Err(Error::Unsupported("clear_partition"))
+    }
+
+    /// Sweep storage for fragments emptied by recent `clear_partition`
+    /// calls. The Phase 6 single-fragment-per-DMap storage handles this
+    /// by running `StorageEngine::compact()` on every registered DMap —
+    /// reclaiming deleted-entry bytes after a migration round. Returns
+    /// the total bytes reclaimed across all dmaps.
+    ///
+    /// Phase 6 — `routing.check_empty_fragments_interval` periodic
+    /// sweep. The default impl is a no-op (remote clients have no local
+    /// storage to compact).
+    async fn cleanup_empty_fragments(&self) -> Result<usize> {
+        Ok(0)
+    }
 }

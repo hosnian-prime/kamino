@@ -27,6 +27,7 @@
 //! Phases 4–9 add: routing table + forwarder, replication, balancer, pub/sub,
 //! locks, additional discovery plugins (Kubernetes, Consul).
 
+pub mod balancer;
 pub mod cluster;
 pub mod discovery;
 pub mod error;
@@ -39,8 +40,13 @@ pub mod routing;
 pub mod swim;
 pub mod transport;
 
+pub use balancer::{
+    BalancerParams, ClusterEvent, ClusterEventsSink, ForwarderTransport, MigrationSource,
+    MigrationTransport, OrphanSink, TracingEventsSink, run_balancer_loop, run_tick,
+};
 pub use cluster::{
-    Cluster, ClusterDeps, MemberProvider, MemberSummary, ReplicationSettings, RoutingProvider,
+    Cluster, ClusterDeps, FragmentCleaner, MemberProvider, MemberSummary, ReplicationSettings,
+    RoutingProvider,
 };
 #[cfg(feature = "discovery-dns")]
 pub use discovery::DnsDiscovery;
