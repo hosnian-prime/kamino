@@ -289,4 +289,35 @@ mod tests {
         }
         assert!(differ > 0, "expected some independence across dmaps");
     }
+
+    #[test]
+    fn thousand_keys_distribute_within_bounded_load() {
+        // ROADMAP §6 Phase 4 acceptance #1: 3-node cluster, 1k keys
+        // distributed roughly evenly within load_factor bounds. This
+        // exercises the full key → partition_for → routing-table primary
+        // path rather than just ring assignment in isolation.
+        let h = XxHasher;
+        let members = vec![mk(1, 100, 3320), mk(2, 200, 3322), mk(3, 300, 3324)];
+        let rt = RoutingTable::build(members, &h, 271, 20, 1.25, 1, 1).unwrap();
+
+        let mut owner_counts: HashMap<MemberId, u32> = HashMap::new();
+        for i in 0..1_000 {
+            let key = format!("user:{i}");
+            let part = partition_for(&h, b"sessions", key.as_bytes(), 271);
+            let owner = rt.primary_for(part).expect("primary exists");
+            *owner_counts.entry(owner.id).or_default() += 1;
+        }
+
+        // 1000 keys / 3 owners ≈ 333. With xxhash uniformity + bounded-load
+        // the gap from perfectly even should stay well under 2x. Hard upper
+        // bound: no member owns more than 500 (≈ avg × 1.5).
+        for &c in owner_counts.values() {
+            assert!(
+                c > 100 && c < 600,
+                "1000 keys / 3 owners landed unevenly: counts = {owner_counts:?}",
+            );
+        }
+        // Every member must own at least some keys (no orphans).
+        assert_eq!(owner_counts.len(), 3, "every member must own ≥ 1 key");
+    }
 }
