@@ -708,8 +708,10 @@ dependencies = [
 name = "kamino-protocol"
 version = "0.0.0"
 dependencies = [
+ "assert_matches",
  "bytes",
  "kamino-core",
+ "proptest",
  "thiserror",
  "tokio",
  "tokio-util",

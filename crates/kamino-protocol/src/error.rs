@@ -20,6 +20,10 @@ pub enum ProtocolError {
     #[error("bulk too large: {size} bytes (max {max})")]
     BulkTooLarge { size: u64, max: u64 },
 
+    /// An array declared more elements than the configured maximum.
+    #[error("array too large: {len} elements (max {max})")]
+    ArrayTooLarge { len: u64, max: u64 },
+
     /// An inline command was rejected (inline commands are not supported
     /// outside of `PING\r\n`).
     #[error("inline command not allowed: {0}")]

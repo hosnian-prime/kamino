@@ -1,13 +1,3 @@
-// Phase 2 contract: agents fill in the codec / parser bodies. Allow the
-// transient "unused" lints until the impls land.
-#![allow(
-    clippy::needless_pass_by_ref_mut,
-    clippy::needless_pass_by_value,
-    clippy::missing_const_for_fn,
-    clippy::too_long_first_doc_paragraph,
-    clippy::unused_self
-)]
-
 //! RESP2/3 wire protocol codec and command AST for Kamino.
 //!
 //! Phase 2 surface (see `docs/06-network-protocol.md` and `ROADMAP.md` §6):
