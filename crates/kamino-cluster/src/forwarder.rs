@@ -120,10 +120,42 @@ impl Forwarder {
     ///
     /// Returns `ClusterError::ServerGone` if the pool can't reach the peer,
     /// `ClusterError::Timeout` if the per-RPC deadline elapses, or
-    /// `ClusterError::Moved` if the peer answers `-MOVED ...`.
+    /// `ClusterError::Moved` if the peer answers `-MOVED ...` (only
+    /// surfaces after the one-shot retry; see [`Self::send_with_retry`]).
     pub async fn send(&self, peer: SocketAddr, cmd: Command) -> ClusterResult<Frame> {
+        self.send_with_retry(peer, cmd).await
+    }
+
+    /// `send` with a single MOVED retry. Per `docs/06-network-protocol.md`
+    /// "Failure Handling on the Forward Path":
+    ///
+    /// > Routing-table staleness | If the forwarded RPC returns ErrMoved
+    /// > (peer no longer owns the partition), the local node refreshes
+    /// > the routing table and retries once. Repeated ErrMoved after
+    /// > refresh returns the error to the client.
+    ///
+    /// The retry target is parsed straight off the MOVED reply
+    /// (`MOVED <partition> <host:port>`). The next coordinator push
+    /// recycles the local routing table; this is the immediate hop.
+    async fn send_with_retry(&self, peer: SocketAddr, cmd: Command) -> ClusterResult<Frame> {
         let pool = self.get_or_create_pool(peer);
-        pool.send(cmd, self.inner.config.request_timeout).await
+        let first = pool.send(cmd.clone(), self.inner.config.request_timeout).await;
+        match first {
+            Err(ClusterError::Moved(msg)) => {
+                // `<partition> <host:port>`
+                let mut parts = msg.split_whitespace();
+                let _part = parts.next();
+                let new_addr_str = parts.next().unwrap_or("");
+                let Ok(new_addr) = new_addr_str.parse::<SocketAddr>() else {
+                    return Err(ClusterError::Moved(msg));
+                };
+                let pool2 = self.get_or_create_pool(new_addr);
+                // A *second* MOVED is surfaced as-is — caller (server
+                // handler / client) decides what to do next.
+                pool2.send(cmd, self.inner.config.request_timeout).await
+            }
+            other => other,
+        }
     }
 
     /// Drain the pool for `peer` and return queued requests with
@@ -183,10 +215,15 @@ struct PeerPool {
     connector: Arc<dyn Connector>,
     /// When set, no more forwards are accepted (peer evicted).
     closed: AtomicBool,
+    /// Current reconnect backoff. Starts at `reconnect_backoff_min`,
+    /// doubles on each consecutive failure (clamped at `..._max`), resets
+    /// to `min` on a successful dial.
+    backoff_current: Mutex<Duration>,
 }
 
 impl PeerPool {
     fn new(addr: SocketAddr, config: ForwarderConfig, connector: Arc<dyn Connector>) -> Self {
+        let min = config.reconnect_backoff_min;
         Self {
             addr,
             config,
@@ -194,7 +231,23 @@ impl PeerPool {
             conns: Mutex::new(Vec::new()),
             connector,
             closed: AtomicBool::new(false),
+            backoff_current: Mutex::new(min),
         }
+    }
+
+    /// Compute the next exponential-backoff delay and rotate the
+    /// `backoff_current` slot for the *next* failure. `min` → `2*min` →
+    /// `4*min` → ... → `max`.
+    fn record_dial_failure(&self) -> Duration {
+        let mut cur = self.backoff_current.lock();
+        let now = *cur;
+        let doubled = now.checked_mul(2).unwrap_or(self.config.reconnect_backoff_max);
+        *cur = doubled.min(self.config.reconnect_backoff_max);
+        now
+    }
+
+    fn record_dial_success(&self) {
+        *self.backoff_current.lock() = self.config.reconnect_backoff_min;
     }
 
     // Clippy's `option_if_let_else` wants `map_or_else`, then its
@@ -243,12 +296,44 @@ impl PeerPool {
     }
 
     async fn dial_new(&self) -> ClusterResult<Arc<PoolConn>> {
-        let stream = self
+        let stream = match self
             .connector
             .connect(self.addr, self.config.connect_timeout)
             .await
-            .map_err(|e| ClusterError::ServerGone(format!("connect {}: {e}", self.addr)))?;
-        PoolConn::start(self.addr, stream, self.config.clone()).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let delay = self.record_dial_failure();
+                trace!(
+                    addr = %self.addr,
+                    backoff = ?delay,
+                    error = %e,
+                    "dial failed; sleeping before surfacing"
+                );
+                tokio::time::sleep(delay).await;
+                return Err(ClusterError::ServerGone(format!(
+                    "connect {}: {e}",
+                    self.addr,
+                )));
+            }
+        };
+        let started = PoolConn::start(self.addr, stream, self.config.clone()).await;
+        let conn = match started {
+            Ok(c) => c,
+            Err(e) => {
+                let delay = self.record_dial_failure();
+                trace!(
+                    addr = %self.addr,
+                    backoff = ?delay,
+                    error = %e,
+                    "handshake failed; sleeping before surfacing"
+                );
+                tokio::time::sleep(delay).await;
+                return Err(e);
+            }
+        };
+        self.record_dial_success();
+        Ok(conn)
     }
 
     fn shutdown(&self) {
@@ -774,6 +859,106 @@ mod tests {
             .await
             .expect_err("should time out");
         assert!(matches!(err, ClusterError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn moved_retry_succeeds_against_new_owner() {
+        // The "wrong" server always replies MOVED to a fixed new addr; the
+        // "right" server replies PONG. Both run behind the same
+        // LocalConnector — we distinguish them by the addr the forwarder
+        // dials. The connector hands out a `MovedEcho` peer when dialled
+        // at `127.0.0.1:65500`, and a `PingEcho` peer when dialled at
+        // `127.0.0.1:9999` (which is the addr embedded in MovedEcho's
+        // reply).
+        #[derive(Debug)]
+        struct SwitchingConnector {
+            moved_addr: SocketAddr,
+            seen: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Connector for SwitchingConnector {
+            async fn connect(
+                &self,
+                addr: SocketAddr,
+                _deadline: Duration,
+            ) -> std::io::Result<Box<dyn DuplexStream>> {
+                let (a, b) = tokio::io::duplex(64 * 1024);
+                if addr == self.moved_addr {
+                    let server = Arc::new(MovedEcho);
+                    tokio::spawn(async move {
+                        server.handle(b).await;
+                    });
+                } else {
+                    let server = Arc::new(PingEcho {
+                        seen: Arc::clone(&self.seen),
+                    });
+                    tokio::spawn(async move {
+                        server.handle(b).await;
+                    });
+                }
+                Ok(Box::new(a))
+            }
+        }
+
+        let moved_addr: SocketAddr = "127.0.0.1:65500".parse().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let connector = Arc::new(SwitchingConnector {
+            moved_addr,
+            seen: Arc::clone(&seen),
+        });
+        let fwd = Forwarder::with_connector(
+            ForwarderConfig {
+                pool_size: 1,
+                inflight_per_conn: 4,
+                connect_timeout: Duration::from_secs(2),
+                request_timeout: Duration::from_secs(2),
+                reconnect_backoff_min: Duration::from_millis(10),
+                reconnect_backoff_max: Duration::from_millis(100),
+                cluster_secret: String::new(),
+            },
+            connector,
+        );
+
+        // First send: dialed at `moved_addr`, replies MOVED to
+        // `127.0.0.1:9999`. The retry connects to the right server and
+        // returns PONG.
+        let r = fwd
+            .send(moved_addr, Command::Ping(None))
+            .await
+            .expect("retry should succeed");
+        assert!(matches!(r, Frame::SimpleString(ref s) if s == "PONG"));
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_until_max() {
+        // Drive `record_dial_failure` directly — exercising the math
+        // without the async dial path.
+        use std::net::{IpAddr, Ipv4Addr};
+        let connector = Arc::new(LocalConnector {
+            server: Arc::new(MovedEcho),
+        });
+        let pool = PeerPool::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234),
+            ForwarderConfig {
+                pool_size: 1,
+                inflight_per_conn: 4,
+                connect_timeout: Duration::from_millis(10),
+                request_timeout: Duration::from_millis(10),
+                reconnect_backoff_min: Duration::from_millis(10),
+                reconnect_backoff_max: Duration::from_millis(80),
+                cluster_secret: String::new(),
+            },
+            connector,
+        );
+        assert_eq!(pool.record_dial_failure(), Duration::from_millis(10));
+        assert_eq!(pool.record_dial_failure(), Duration::from_millis(20));
+        assert_eq!(pool.record_dial_failure(), Duration::from_millis(40));
+        assert_eq!(pool.record_dial_failure(), Duration::from_millis(80));
+        // Clamped at max.
+        assert_eq!(pool.record_dial_failure(), Duration::from_millis(80));
+        pool.record_dial_success();
+        assert_eq!(pool.record_dial_failure(), Duration::from_millis(10));
     }
 
     #[tokio::test]

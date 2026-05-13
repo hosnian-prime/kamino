@@ -56,9 +56,18 @@ pub(crate) fn quit() -> Response {
 pub(crate) fn auth(
     state: &mut ConnState,
     server_password: &str,
+    cluster_secret: &str,
     username: Option<&Bytes>,
     password: &Bytes,
 ) -> Response {
+    // Match the inter-node `cluster_secret` first: an empty secret means
+    // "this deployment does not run inter-node auth", in which case we
+    // ignore that branch and fall through to client-password matching.
+    if !cluster_secret.is_empty() && password.as_ref() == cluster_secret.as_bytes() {
+        state.auth = AuthState::Authenticated;
+        state.internode = true;
+        return Response::ok(Frame::ok());
+    }
     if server_password.is_empty() {
         return Response::ok(Frame::Error(NO_PASSWORD_SET.into()));
     }
@@ -69,6 +78,7 @@ pub(crate) fn auth(
     }
     if password.as_ref() == server_password.as_bytes() {
         state.auth = AuthState::Authenticated;
+        state.internode = false;
         Response::ok(Frame::ok())
     } else {
         Response::ok(Frame::Error(WRONGPASS.into()))
@@ -78,12 +88,19 @@ pub(crate) fn auth(
 pub(crate) fn hello(
     state: &mut ConnState,
     server_password: &str,
+    cluster_secret: &str,
     args: &HelloArgs,
     server_version: &str,
     server_id: u64,
 ) -> Response {
     if let Some((username, password)) = &args.auth {
-        let resp = auth(state, server_password, username.as_ref(), password);
+        let resp = auth(
+            state,
+            server_password,
+            cluster_secret,
+            username.as_ref(),
+            password,
+        );
         if matches!(resp.frame, Frame::Error(_)) {
             return resp;
         }
@@ -388,10 +405,6 @@ pub(crate) async fn dm_del(
         ));
     }
 
-    // Phase 4 wire shape: fan-out runs locally for now (Phase 5+ will route
-    // remote buckets through the Forwarder). Remote buckets are reported as
-    // a PARTIAL with `first_error = "ErrServerGone (forwarder unwired)"`
-    // when not handled, so behaviour stays observable end-to-end.
     let mut deleted = 0_i64;
     let mut first_error: Option<String> = None;
     if let Some(local_keys) = buckets.remove(&None) {
@@ -400,9 +413,27 @@ pub(crate) async fn dm_del(
             Err(frame) => return Response::ok(frame),
         }
     }
-    for (_addr, _keys) in buckets {
-        if first_error.is_none() {
-            first_error = Some("ErrServerGone (cross-partition forward not wired)".into());
+    // Fan out remote buckets in parallel — bounded by the per-peer
+    // forwarder inflight semaphore inside RoutingProvider::forward_dm_del.
+    let remote: Vec<(std::net::SocketAddr, Vec<Bytes>)> = buckets
+        .into_iter()
+        .filter_map(|(addr, keys)| addr.map(|a| (a, keys)))
+        .collect();
+    if !remote.is_empty() {
+        let mut futures = Vec::with_capacity(remote.len());
+        for (addr, keys) in remote {
+            futures.push(routing.forward_dm_del(addr, dmap.clone(), keys));
+        }
+        let results = futures::future::join_all(futures).await;
+        for r in results {
+            match r {
+                Ok(n) => deleted += n,
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(format!("{e}"));
+                    }
+                }
+            }
         }
     }
 

@@ -146,6 +146,7 @@ impl Server {
         let ctx = Arc::new(ServerContext {
             client,
             password: config.auth.password.clone(),
+            cluster_secret: config.auth.cluster_secret.clone(),
             metrics: Arc::new(ServerMetrics::new()),
             version: env!("CARGO_PKG_VERSION"),
             id,

@@ -499,6 +499,21 @@ pub trait RoutingProvider: Send + Sync {
     /// Whether the server must reject multi-key requests that cross
     /// partitions (`network.multi_key_strict`).
     fn multi_key_strict(&self) -> bool;
+
+    /// Forward an already-grouped `DM.DEL <dmap> <keys...>` to `peer` and
+    /// return the deleted-count.
+    ///
+    /// Returns `Err(ClusterError::*)` on transport failure; the caller
+    /// translates that into the `+PARTIAL` reply per
+    /// `docs/06-network-protocol.md` Multi-Key Operations.
+    fn forward_dm_del<'a>(
+        &'a self,
+        peer: SocketAddr,
+        dmap: bytes::Bytes,
+        keys: Vec<bytes::Bytes>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<i64, ClusterError>> + Send + 'a>,
+    >;
 }
 
 impl RoutingProvider for Cluster {
@@ -546,6 +561,43 @@ impl RoutingProvider for Cluster {
 
     fn multi_key_strict(&self) -> bool {
         self.network_config.multi_key_strict
+    }
+
+    fn forward_dm_del<'a>(
+        &'a self,
+        peer: SocketAddr,
+        dmap: bytes::Bytes,
+        keys: Vec<bytes::Bytes>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<i64, ClusterError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let Some(fwd) = self.forwarder.clone() else {
+                return Err(ClusterError::ServerGone(format!(
+                    "forwarder unavailable; cannot reach {peer}",
+                )));
+            };
+            let cmd = kamino_protocol::Command::DmDel { dmap, keys };
+            match fwd.send(peer, cmd).await? {
+                kamino_protocol::Frame::Integer(n) => Ok(n),
+                kamino_protocol::Frame::SimpleString(s) if s.starts_with("PARTIAL ") => {
+                    // Peer itself fanned out and returned partial — parse
+                    // "PARTIAL <n> <err>" and surface the count. Detail in
+                    // the error tail rides our own ServerGone for now.
+                    let mut parts = s.splitn(3, ' ');
+                    let _ = parts.next();
+                    let count = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    let rest = parts.next().unwrap_or("").to_string();
+                    Err(ClusterError::ServerGone(format!(
+                        "downstream partial: count={count}, err={rest}",
+                    )))
+                }
+                kamino_protocol::Frame::Error(e) => Err(ClusterError::ServerGone(e)),
+                other => Err(ClusterError::Codec(format!(
+                    "unexpected DM.DEL reply: {other:?}",
+                ))),
+            }
+        })
     }
 }
 

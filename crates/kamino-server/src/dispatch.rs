@@ -20,6 +20,10 @@ use crate::state::ConnState;
 pub(crate) struct ServerContext {
     pub(crate) client: Arc<dyn Client>,
     pub(crate) password: String,
+    /// Inter-node shared secret. Empty ⇒ inter-node auth disabled (the
+    /// `INTERNAL.NODE.*` gate then falls back to the local-config check:
+    /// `routing_provider.is_some()`).
+    pub(crate) cluster_secret: String,
     pub(crate) metrics: Arc<ServerMetrics>,
     pub(crate) version: &'static str,
     pub(crate) id: u64,
@@ -39,6 +43,7 @@ impl std::fmt::Debug for ServerContext {
         // log-safe.
         f.debug_struct("ServerContext")
             .field("password_set", &!self.password.is_empty())
+            .field("cluster_secret_set", &!self.cluster_secret.is_empty())
             .field("version", &self.version)
             .field("id", &self.id)
             .field("member_provider", &self.member_provider.is_some())
@@ -48,6 +53,7 @@ impl std::fmt::Debug for ServerContext {
 }
 
 const NOAUTH: &str = "NOAUTH Authentication required";
+const NOPERM_INTERNAL: &str = "NOPERM INTERNAL.NODE.* requires cluster_secret auth";
 
 pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Command) -> Response {
     ctx.metrics.on_command();
@@ -56,16 +62,31 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
         return Response::ok(Frame::Error(NOAUTH.into()));
     }
 
+    if !is_internal_allowed(ctx, state, &cmd) {
+        return Response::ok(Frame::Error(NOPERM_INTERNAL.into()));
+    }
+
     if let Some(moved) = check_routing(ctx, &cmd) {
         return moved;
     }
 
     match cmd {
         Command::Ping(msg) => handlers::ping(msg.as_ref()),
-        Command::Auth { username, password } => {
-            handlers::auth(state, &ctx.password, username.as_ref(), &password)
-        }
-        Command::Hello(args) => handlers::hello(state, &ctx.password, &args, ctx.version, ctx.id),
+        Command::Auth { username, password } => handlers::auth(
+            state,
+            &ctx.password,
+            &ctx.cluster_secret,
+            username.as_ref(),
+            &password,
+        ),
+        Command::Hello(args) => handlers::hello(
+            state,
+            &ctx.password,
+            &ctx.cluster_secret,
+            &args,
+            ctx.version,
+            ctx.id,
+        ),
         Command::Quit => handlers::quit(),
         Command::Stats => handlers::stats(ctx.metrics.snapshot(), ctx.version),
 
@@ -137,6 +158,25 @@ const fn is_pre_auth_command(cmd: &Command) -> bool {
     )
 }
 
+/// `INTERNAL.NODE.*` commands are restricted to peers that authenticated
+/// with `cluster_secret` (per `docs/06-network-protocol.md` "Inter-Node
+/// Authentication"). When the deployment configures no `cluster_secret`
+/// (empty string), inter-node auth is disabled and any authenticated
+/// client passes — that matches the existing single-node trust model.
+fn is_internal_allowed(ctx: &ServerContext, state: &ConnState, cmd: &Command) -> bool {
+    let is_internal = matches!(
+        cmd,
+        Command::InternalNodeUpdateRouting { .. } | Command::InternalNodeLengthOfPart { .. }
+    );
+    if !is_internal {
+        return true;
+    }
+    if ctx.cluster_secret.is_empty() {
+        return true;
+    }
+    state.internode
+}
+
 /// Per `docs/02-consistent-hashing.md`, a node that receives a single-key
 /// DM.* command for a partition it does not own returns `-MOVED <part>
 /// <addr>`. The client then refreshes routing and retries (Phase 4).
@@ -178,6 +218,7 @@ mod tests {
         ServerContext {
             client: dummy_client(),
             password: String::new(),
+            cluster_secret: String::new(),
             metrics: Arc::new(ServerMetrics::new()),
             version: "0.0.0",
             id: 1,
@@ -452,12 +493,29 @@ mod tests {
         fn multi_key_strict(&self) -> bool {
             self.strict
         }
+        fn forward_dm_del<'a>(
+            &'a self,
+            _peer: std::net::SocketAddr,
+            _dmap: bytes::Bytes,
+            keys: Vec<bytes::Bytes>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<i64, ClusterError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            // Stub: pretend every forwarded key was deleted successfully.
+            let n = i64::try_from(keys.len()).unwrap_or(0);
+            Box::pin(async move { Ok(n) })
+        }
     }
 
     fn ctx_with_router(router: Arc<dyn RoutingProvider>) -> ServerContext {
         ServerContext {
             client: dummy_client(),
             password: String::new(),
+            cluster_secret: String::new(),
             metrics: Arc::new(ServerMetrics::new()),
             version: "0.0.0",
             id: 1,
@@ -548,7 +606,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dm_del_lenient_partial_when_cross_partition() {
+    async fn internal_node_requires_cluster_secret() {
+        // Server has cluster_secret set; a connection authed with the *client*
+        // password (not the cluster secret) must NOT pass the INTERNAL gate.
+        let mut ctx = ctx_no_auth();
+        ctx.password = "clientpass".into();
+        ctx.cluster_secret = "topsecret".into();
+        ctx.routing_provider = Some(Arc::new(StubRouter {
+            forced: None,
+            strict: false,
+        }));
+
+        let mut st = ConnState::new(true);
+        // Authenticate with the client password.
+        let auth_resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::Auth {
+                username: None,
+                password: Bytes::from_static(b"clientpass"),
+            },
+        )
+        .await;
+        assert!(matches!(auth_resp.frame, Frame::SimpleString(ref s) if s == "OK"));
+        assert!(st.is_authed());
+        assert!(!st.internode, "client-password auth must NOT set internode");
+
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::InternalNodeUpdateRouting {
+                table: Bytes::from_static(b"\x80"),
+            },
+        )
+        .await;
+        let Frame::Error(msg) = resp.frame else {
+            panic!("expected NOPERM");
+        };
+        assert!(msg.starts_with("NOPERM"), "got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn internal_node_passes_with_cluster_secret_auth() {
+        let mut ctx = ctx_no_auth();
+        ctx.password = "clientpass".into();
+        ctx.cluster_secret = "topsecret".into();
+        ctx.routing_provider = Some(Arc::new(StubRouter {
+            forced: None,
+            strict: false,
+        }));
+
+        let mut st = ConnState::new(true);
+        // Authenticate with the cluster_secret.
+        let auth_resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::Auth {
+                username: None,
+                password: Bytes::from_static(b"topsecret"),
+            },
+        )
+        .await;
+        assert!(matches!(auth_resp.frame, Frame::SimpleString(ref s) if s == "OK"));
+        assert!(st.internode, "cluster_secret auth must set internode");
+
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::InternalNodeUpdateRouting {
+                table: Bytes::from_static(b"\x80"),
+            },
+        )
+        .await;
+        // StubRouter says `Ok(Accepted)` so the handler returns +OK. The
+        // key assertion is the *absence* of NOPERM — i.e. the cluster-
+        // secret gate let us through.
+        match resp.frame {
+            Frame::Error(ref m) => assert!(
+                !m.starts_with("NOPERM"),
+                "expected non-NOPERM, got {m:?}",
+            ),
+            Frame::SimpleString(_) => {} // accepted
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dm_del_lenient_forwards_cross_partition() {
+        // StubRouter::forward_dm_del returns the supplied key count, so
+        // sending 2 cross-partition keys should yield Integer(2).
         let forced = "127.0.0.1:9999".parse().unwrap();
         let router: Arc<dyn RoutingProvider> = Arc::new(StubRouter {
             forced: Some(forced),
@@ -565,9 +711,10 @@ mod tests {
             },
         )
         .await;
-        let Frame::SimpleString(s) = resp.frame else {
-            panic!("expected +PARTIAL simple-string reply");
-        };
-        assert!(s.starts_with("PARTIAL"), "got {s:?}");
+        // Stub treats forwarded keys as successfully deleted.
+        match resp.frame {
+            Frame::Integer(n) => assert_eq!(n, 2),
+            other => panic!("expected Integer(2), got {other:?}"),
+        }
     }
 }

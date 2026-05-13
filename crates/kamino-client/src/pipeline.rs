@@ -135,34 +135,43 @@ impl Pipeline {
 
     /// Drain every op and return per-op results, preserving submission order.
     ///
-    /// Phase 4: dispatched sequentially against `self.dmap`. The
-    /// `concurrency` knob is honoured by future multi-node clients; for the
-    /// in-process / single-RemoteClient case ordering and parallelism are
-    /// equivalent under the per-DMap mutex semantics of the storage engine.
+    /// Ops dispatch concurrently against `self.dmap`, bounded by
+    /// `options.concurrency` permits. Per `docs/08-api-design.md`, this is
+    /// the contract that lets cross-partition ops run in parallel — for an
+    /// embedded/single-conn DMap the in-flight queue still serialises in
+    /// input order on the receiving side, which preserves the documented
+    /// per-primary ordering guarantee.
     pub async fn execute(self) -> Vec<Result<PipelineResult>> {
+        use futures::stream::{self, StreamExt as _};
         let Self {
             dmap,
             options,
             ops,
         } = self;
-        // Phase 4 ships sequential dispatch — single-process / single-conn
-        // RemoteClient already preserves order. Cross-partition concurrent
-        // dispatch is on the MultiNodeClient roadmap (Phase 5+).
-        let _ = options;
-        let mut out = Vec::with_capacity(ops.len());
-        for op in ops {
-            let result = match op {
-                PipelineOp::Put {
-                    key,
-                    value,
-                    options,
-                } => dmap.put(&key, &value, options).await.map(|()| PipelineResult::Put),
-                PipelineOp::Get { key } => dmap.get(&key).await.map(PipelineResult::Get),
-                PipelineOp::Delete { key } => dmap.delete(&key).await.map(PipelineResult::Delete),
-            };
-            out.push(result);
-        }
-        out
+        let concurrency = options.concurrency.max(1);
+        let dmap = Arc::clone(&dmap);
+        stream::iter(ops.into_iter().map(move |op| {
+            let dmap = Arc::clone(&dmap);
+            async move {
+                match op {
+                    PipelineOp::Put {
+                        key,
+                        value,
+                        options,
+                    } => dmap
+                        .put(&key, &value, options)
+                        .await
+                        .map(|()| PipelineResult::Put),
+                    PipelineOp::Get { key } => dmap.get(&key).await.map(PipelineResult::Get),
+                    PipelineOp::Delete { key } => {
+                        dmap.delete(&key).await.map(PipelineResult::Delete)
+                    }
+                }
+            }
+        }))
+        .buffered(concurrency)
+        .collect()
+        .await
     }
 }
 
