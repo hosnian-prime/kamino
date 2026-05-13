@@ -1,5 +1,28 @@
-//! Client surface: `Client` trait plus `RemoteClient` and `EmbeddedClient`.
+#![allow(clippy::doc_markdown)] // contract doc references are intentionally bare
+
+//! Client surface: `Client`/`DMap` traits and the `EmbeddedClient`.
 //!
-//! Phase 0 ships only the skeleton; `Client`/`DMap` traits land in Phase 1,
-//! `RemoteClient` in Phase 2, cross-partition `Pipeline` and `ScanCursor` in
-//! Phase 4 (see `ROADMAP.md`).
+//! Phase 1 scope: in-process embedded solo. `RemoteClient` and cross-partition
+//! `Pipeline` / `ScanCursor` land in later phases (see `ROADMAP.md`).
+//!
+//! See `docs/08-api-design.md` for the contract.
+
+pub mod cursor;
+pub mod dmap;
+pub mod embedded;
+pub mod error;
+pub mod lock;
+pub mod remote;
+pub mod stats;
+pub mod traits;
+pub mod types;
+
+pub use cursor::{ScanCursor, ScanOptions};
+pub use dmap::DMap;
+pub use embedded::{EmbeddedClient, EmbeddedDMap};
+pub use error::{Error, Result};
+pub use lock::LockContext;
+pub use remote::{RemoteClient, RemoteDMap};
+pub use stats::{DMapStats, Stats, StatsOptions};
+pub use traits::Client;
+pub use types::{DMapOptions, GetResponse, PutOptions};

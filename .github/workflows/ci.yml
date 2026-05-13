@@ -73,6 +73,32 @@ jobs:
         if: matrix.features == 'none'
         run: cargo test --workspace --locked --no-default-features
 
+  perf-gate:
+    name: perf gate (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --release perf_gate
+        run: cargo test -p kamino --test perf_gate --release --locked -- --nocapture
+
+  loom:
+    name: loom (Locker cleanup race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --cfg loom locker_loom
+        env:
+          RUSTFLAGS: "--cfg loom"
+        run: cargo test -p kamino-storage --test locker_loom --release --locked
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

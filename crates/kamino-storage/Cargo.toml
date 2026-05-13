@@ -20,3 +20,23 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 roaring = { workspace = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
+regex = "1.10"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+assert_matches = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+criterion = { workspace = true }
+loom = { workspace = true }
+
+[[bench]]
+name = "ramblock"
+harness = false
+
+# Loom test runs with `RUSTFLAGS="--cfg loom" cargo test --test locker_loom`.
+[[test]]
+name = "locker_loom"
+path = "tests/locker_loom.rs"
+harness = true

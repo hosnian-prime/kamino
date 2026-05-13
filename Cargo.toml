@@ -26,6 +26,9 @@ unsafe_code = "forbid"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
+# Declare `--cfg loom` (used by the kamino-storage Locker model test) so
+# normal builds don't warn about an unknown cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -79,6 +82,7 @@ winnow = "0.6"
 
 # Storage helpers
 roaring = "0.10"
+regex = "1.10"
 
 # Logging detail / IDs
 rand = "0.8"
@@ -90,6 +94,7 @@ clap = { version = "4", features = ["derive"] }
 proptest = "1.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 assert_matches = "1.5"
+loom = "0.7"
 
 [profile.release]
 opt-level = 3

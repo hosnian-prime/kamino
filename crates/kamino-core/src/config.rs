@@ -15,6 +15,8 @@ use crate::error::{Error, Result};
 use crate::mode::Mode;
 use crate::profile::Profile;
 
+pub mod env;
+
 // ---------------------------------------------------------------------------
 // Top-level Config
 // ---------------------------------------------------------------------------
@@ -151,6 +153,20 @@ impl Config {
             });
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Env overlay convenience method (Phase 2).
+// ---------------------------------------------------------------------------
+
+impl Config {
+    /// Apply `KAMINO_*` environment-variable overrides on top of this config
+    /// (per `docs/16-config-architecture.md` — double-underscore separator
+    /// between section and field, lower-cased). Validates after merging.
+    pub fn with_env_overlay(mut self) -> Result<Self> {
+        env::overlay_from_env(&mut self)?;
+        Ok(self)
     }
 }
 

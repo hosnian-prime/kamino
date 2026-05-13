@@ -1,6 +1,6 @@
 [package]
 name = "kamino-client"
-description = "Client traits, RemoteClient (TCP) and EmbeddedClient for Kamino."
+description = "Client traits, EmbeddedClient and (future) RemoteClient for Kamino."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,10 +13,18 @@ workspace = true
 
 [dependencies]
 kamino-core = { workspace = true }
-kamino-cluster = { workspace = true }
+kamino-storage = { workspace = true }
 kamino-protocol = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
