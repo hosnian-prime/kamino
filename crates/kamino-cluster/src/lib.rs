@@ -30,6 +30,7 @@ pub use discovery::DnsDiscovery;
 pub use discovery::{DiscoveryPlugin, StaticDiscovery};
 pub use error::{ClusterError, ClusterResult};
 pub use gossip::GossipQueue;
+pub use join::{JOIN_TARGET_SENTINEL, JoinParams, join};
 pub use membership::{ApplyOutcome, MemberEntry, MemberState, MembershipView};
 pub use message::{Envelope, GossipEvent, Incarnation, SwimMessage, alive_for};
 pub use swim::{ProbeOutcome, SwimDriver, run_probe_loop, run_receive_loop};

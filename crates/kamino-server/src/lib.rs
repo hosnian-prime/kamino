@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use kamino_client::Client;
+use kamino_cluster::{Cluster, MemberProvider};
 use kamino_core::{Config, Mode};
 use rand::RngCore;
 use tokio::net::TcpListener;
@@ -100,6 +101,33 @@ impl Server {
         if config.mode != Mode::Standalone {
             return Err(ServerError::WrongMode(config.mode.as_str()));
         }
+        Self::bind_internal(config, client, None).await
+    }
+
+    /// Like [`Server::bind`] but registers `cluster` as the `MemberProvider`
+    /// so the `CLUSTER.MEMBERS` handler returns live SWIM data instead of
+    /// an empty array.
+    ///
+    /// The server takes a reference-counted handle to the running cluster
+    /// runtime; lifetime management remains the caller's responsibility
+    /// (typically the umbrella `Kamino` builder).
+    pub async fn bind_with_cluster(
+        config: &Config,
+        client: Arc<dyn Client>,
+        cluster: Arc<Cluster>,
+    ) -> Result<Self, ServerError> {
+        if config.mode != Mode::Standalone {
+            return Err(ServerError::WrongMode(config.mode.as_str()));
+        }
+        let provider: Arc<dyn MemberProvider> = cluster;
+        Self::bind_internal(config, client, Some(provider)).await
+    }
+
+    async fn bind_internal(
+        config: &Config,
+        client: Arc<dyn Client>,
+        member_provider: Option<Arc<dyn MemberProvider>>,
+    ) -> Result<Self, ServerError> {
         let addr = SocketAddr::new(config.network.bind_addr, config.network.bind_port);
         let listener = TcpListener::bind(addr)
             .await
@@ -113,7 +141,7 @@ impl Server {
             metrics: Arc::new(ServerMetrics::new()),
             version: env!("CARGO_PKG_VERSION"),
             id,
-            member_provider: None,
+            member_provider,
         });
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let settings = ConnSettings {
