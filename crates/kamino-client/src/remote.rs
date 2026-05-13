@@ -141,10 +141,13 @@ impl RemoteClient {
         });
         let client = Self { inner };
 
-        // Send `HELLO 3` with optional inline auth.
+        // Send `HELLO 2` with optional inline auth. We stay on RESP2 in
+        // Phase 2 because RESP3-only payloads (Map / Push) require both
+        // sides to flip their codec mid-stream; that coordination lands
+        // with the pub/sub work in Phase 7 (which needs push frames).
         let auth_arg = auth.map(|p| (None::<Bytes>, Bytes::copy_from_slice(p.as_bytes())));
         let hello = HelloArgs {
-            protocol_version: Some(3),
+            protocol_version: Some(2),
             auth: auth_arg,
             client_name: None,
         };
@@ -552,13 +555,22 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (sink, stream) = framed.split();
+    // Reader cancels this once the socket EOFs / errors; the writer's main
+    // loop selects on it so new commands get rejected immediately instead of
+    // hanging on a response that will never come.
+    let cancel = tokio_util::sync::CancellationToken::new();
     (
         WriterTask {
             sink,
             cmd_rx,
             in_flight: Arc::clone(&in_flight),
+            cancel: cancel.clone(),
         },
-        ReaderTask { stream, in_flight },
+        ReaderTask {
+            stream,
+            in_flight,
+            cancel,
+        },
     )
 }
 
@@ -566,6 +578,7 @@ struct WriterTask<S> {
     sink: futures::stream::SplitSink<Framed<S, RespCodec>, Frame>,
     cmd_rx: mpsc::Receiver<(Command, ResponseSlot)>,
     in_flight: Arc<Mutex<VecDeque<ResponseSlot>>>,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl<S> WriterTask<S>
@@ -573,17 +586,37 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     async fn run(mut self) {
-        while let Some((cmd, slot)) = self.cmd_rx.recv().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => None,
+                v = self.cmd_rx.recv() => v,
+            };
+            let Some((cmd, slot)) = next else { break };
+
+            // Reader is gone — fail this command immediately rather than
+            // pushing it into a queue that will never be drained.
+            if self.cancel.is_cancelled() {
+                let _ = slot.send(Err(ConnError::Closed("server closed connection".into())));
+                continue;
+            }
+
             let frame = cmd.to_frame();
             self.in_flight.lock().push_back(slot);
             if let Err(e) = self.sink.send(frame).await {
                 warn!(?e, "remote-client send error; failing in-flight");
                 self.fail_all(&ConnError::Protocol(e.to_string()));
+                self.cancel.cancel();
                 return;
             }
         }
-        // Channel closed by client drop / close().
-        self.fail_all(&ConnError::Closed("client dropped".into()));
+        // Channel closed by client drop / close(), or reader signalled EOF.
+        let reason = if self.cancel.is_cancelled() {
+            ConnError::Closed("server closed connection".into())
+        } else {
+            ConnError::Closed("client dropped".into())
+        };
+        self.fail_all(&reason);
         debug!("remote-client writer exiting");
     }
 
@@ -598,6 +631,7 @@ where
 struct ReaderTask<S> {
     stream: futures::stream::SplitStream<Framed<S, RespCodec>>,
     in_flight: Arc<Mutex<VecDeque<ResponseSlot>>>,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl<S> ReaderTask<S>
@@ -611,6 +645,7 @@ where
                 Err(e) => {
                     warn!(?e, "remote-client decode error; failing in-flight");
                     self.fail_all(&ConnError::Protocol(e.to_string()));
+                    self.cancel.cancel();
                     return;
                 }
             };
@@ -622,6 +657,7 @@ where
             }
         }
         self.fail_all(&ConnError::Closed("server closed connection".into()));
+        self.cancel.cancel();
         debug!("remote-client reader exiting");
     }
 

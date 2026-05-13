@@ -2,10 +2,7 @@
 //! exercise the same operations Phase 1's `embedded_smoke.rs` covers, via
 //! `RemoteClient`.
 //!
-//! NOTE: every test in this file is `#[ignore]`-gated. The orchestrator
-//! un-ignores them after merging Phase 2A (the codec impl) — until then the
-//! `RespCodec` encode/decode bodies panic with `unimplemented!()`. They are
-//! kept compiled so the surface drift gets caught immediately.
+//! Runs against the real `RespCodec` from `kamino-protocol`.
 
 #![allow(clippy::field_reassign_with_default)]
 
@@ -55,7 +52,6 @@ async fn start_server(mut config: Config) -> TestServer {
 }
 
 #[tokio::test]
-#[ignore = "enabled after merge with Phase 2A (codec impl)"]
 async fn ping_round_trips() {
     let cfg = Config::default();
     let TestServer { server, _embedded } = start_server(cfg).await;
@@ -74,7 +70,6 @@ async fn ping_round_trips() {
 }
 
 #[tokio::test]
-#[ignore = "enabled after merge with Phase 2A (codec impl)"]
 async fn put_get_delete_round_trip() {
     let cfg = Config::default();
     let TestServer { server, _embedded } = start_server(cfg).await;
@@ -103,7 +98,6 @@ async fn put_get_delete_round_trip() {
 }
 
 #[tokio::test]
-#[ignore = "enabled after merge with Phase 2A (codec impl)"]
 async fn auth_required_blocks_unauthenticated_dm_put() {
     let mut cfg = Config::default();
     cfg.auth.password = "secret".into();
@@ -141,7 +135,6 @@ async fn auth_required_blocks_unauthenticated_dm_put() {
 }
 
 #[tokio::test]
-#[ignore = "enabled after merge with Phase 2A (codec impl)"]
 async fn idle_close_disconnects() {
     let mut cfg = Config::default();
     cfg.network.idle_close = Duration::from_millis(200);
@@ -163,7 +156,6 @@ async fn idle_close_disconnects() {
 }
 
 #[tokio::test]
-#[ignore = "enabled after merge with Phase 2A (codec impl)"]
 async fn hello_resp3_upgrade() {
     let cfg = Config::default();
     let TestServer { server, _embedded } = start_server(cfg).await;

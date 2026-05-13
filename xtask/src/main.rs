@@ -80,11 +80,18 @@ fn allowed_edges() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ),
         (
             "kamino-server",
+            // `kamino-client` + `kamino-storage` are needed in Phase 2: the
+            // server wraps an `EmbeddedClient` directly and constructs
+            // `RamBlock` engines because no cluster service layer exists
+            // yet. From Phase 3 onward this should narrow to the cluster
+            // surface.
             &[
                 "kamino-core",
                 "kamino-protocol",
                 "kamino-cluster",
                 "kamino-observability",
+                "kamino-client",
+                "kamino-storage",
             ],
         ),
         (
