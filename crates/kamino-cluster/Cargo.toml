@@ -47,5 +47,5 @@ assert_matches = { workspace = true }
 tracing = { workspace = true }
 # Self-reference enables the `mock-transport` feature for integration tests so
 # they can use the in-memory `MockTransport`. Documented Cargo pattern; works
-# on stable.
-kamino-cluster = { path = ".", features = ["mock-transport"] }
+# on stable. An explicit version satisfies `cargo-deny`'s wildcard ban.
+kamino-cluster = { path = ".", version = "0.0.0", features = ["mock-transport"] }

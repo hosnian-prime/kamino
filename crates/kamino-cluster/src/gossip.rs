@@ -99,7 +99,9 @@ impl GossipQueue {
 }
 
 fn budget_for(live_member_count: usize) -> u32 {
-    let n = live_member_count.max(1) as u32;
+    // Saturate the cluster size to u32::MAX — far above any realistic count;
+    // the log2 step compresses the result back to a small integer.
+    let n = u32::try_from(live_member_count.max(1)).unwrap_or(u32::MAX);
     let log2 = 32 - n.leading_zeros(); // ceil(log2(n + 1))
     GOSSIP_FANOUT_MULT.saturating_mul(log2)
 }

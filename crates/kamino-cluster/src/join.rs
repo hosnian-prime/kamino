@@ -229,7 +229,7 @@ mod tests {
             clock: Arc::new(SystemClock),
             local,
         };
-        Arc::new(Cluster::assemble(deps).expect("assemble"))
+        Arc::new(Cluster::assemble(deps))
     }
 
     #[tokio::test]
@@ -274,7 +274,7 @@ mod tests {
             clock: Arc::new(SystemClock),
             local,
         };
-        let cluster = Arc::new(Cluster::assemble(deps).expect("assemble"));
+        let cluster = Arc::new(Cluster::assemble(deps));
         let params = JoinParams {
             discovery: cluster.discovery_config().clone(),
             probe_timeout: Duration::from_millis(30),

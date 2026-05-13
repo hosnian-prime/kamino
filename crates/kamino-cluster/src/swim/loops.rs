@@ -19,6 +19,7 @@ use rand::seq::SliceRandom;
 use tokio::time::{Duration, timeout};
 
 use super::SwimDriver;
+use crate::join::JOIN_TARGET_SENTINEL;
 use crate::membership::{ApplyOutcome, MemberState};
 use crate::message::{Envelope, GossipEvent, SwimMessage, alive_for};
 
@@ -253,9 +254,25 @@ async fn handle_envelope(
 
     match env.msg {
         SwimMessage::Ping { seq, target } => {
-            if target != local_id {
+            // `target == JOIN_TARGET_SENTINEL` is the join-request marker (see
+            // `join.rs` wire contract). A node that just woke up cannot know
+            // our id yet, so it sends `target = MemberId(0)` and piggybacks an
+            // `Alive` for itself. We answer with `Ack` + piggybacked `Alive`
+            // for ourselves so the joiner learns who we are.
+            let is_join_probe = target == JOIN_TARGET_SENTINEL;
+            if !is_join_probe && target != local_id {
                 tracing::trace!(target = %target, local = %local_id, "swim recv: ping for wrong target, dropping");
                 return Ok(());
+            }
+            if is_join_probe {
+                // Make sure our own Alive ends up in the ack gossip even if
+                // the queue is empty at this moment.
+                if let Some(entry) = driver.view.get(local_id) {
+                    driver.queue.push(
+                        alive_for(&entry.member, entry.incarnation),
+                        driver.view.live_count(),
+                    );
+                }
             }
             let gossip = drain_gossip(driver);
             let ack = Envelope {

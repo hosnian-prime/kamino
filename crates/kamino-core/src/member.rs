@@ -60,7 +60,7 @@ impl Member {
 
     /// Ordering key for coordinator selection: `(birthdate, id)` ascending.
     #[must_use]
-    pub fn coord_key(&self) -> (u64, u64) {
+    pub const fn coord_key(&self) -> (u64, u64) {
         (self.birthdate, self.id.as_u64())
     }
 }
@@ -92,7 +92,13 @@ mod tests {
     fn mk(id: u64, birthdate: u64) -> Member {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3320);
         let disc = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3322);
-        Member::new(MemberId::from_raw(id), format!("n{id}"), addr, disc, birthdate)
+        Member::new(
+            MemberId::from_raw(id),
+            format!("n{id}"),
+            addr,
+            disc,
+            birthdate,
+        )
     }
 
     #[test]

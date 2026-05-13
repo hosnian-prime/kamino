@@ -63,7 +63,10 @@ pub enum GossipEvent {
         from: MemberId,
     },
     /// `id` is leaving the cluster voluntarily.
-    Leave { id: MemberId, incarnation: Incarnation },
+    Leave {
+        id: MemberId,
+        incarnation: Incarnation,
+    },
 }
 
 /// The kind of SWIM message; the wire `Envelope` wraps this with shared
@@ -145,7 +148,7 @@ impl Envelope {
                 bytes[2]
             )));
         }
-        rmp_serde::from_slice::<Envelope>(&bytes[HEADER.len()..])
+        rmp_serde::from_slice::<Self>(&bytes[HEADER.len()..])
             .map_err(|e| ClusterError::Codec(format!("decode envelope: {e}")))
     }
 
@@ -154,9 +157,7 @@ impl Envelope {
         if self.cluster_secret == expected {
             Ok(())
         } else {
-            Err(ClusterError::Handshake(
-                "cluster_secret mismatch".into(),
-            ))
+            Err(ClusterError::Handshake("cluster_secret mismatch".into()))
         }
     }
 }
@@ -210,14 +211,20 @@ mod tests {
     fn bad_magic_rejected() {
         let mut bytes = mk_envelope().encode().unwrap();
         bytes[0] = b'X';
-        assert!(matches!(Envelope::decode(&bytes), Err(ClusterError::Codec(_))));
+        assert!(matches!(
+            Envelope::decode(&bytes),
+            Err(ClusterError::Codec(_))
+        ));
     }
 
     #[test]
     fn unknown_version_rejected() {
         let mut bytes = mk_envelope().encode().unwrap();
         bytes[2] = 0xFF;
-        assert!(matches!(Envelope::decode(&bytes), Err(ClusterError::Codec(_))));
+        assert!(matches!(
+            Envelope::decode(&bytes),
+            Err(ClusterError::Codec(_))
+        ));
     }
 
     #[test]

@@ -20,9 +20,9 @@ impl StaticDiscovery {
     pub fn new(peers: &[String]) -> ClusterResult<Self> {
         let mut parsed = Vec::with_capacity(peers.len());
         for raw in peers {
-            let addr = raw.parse::<SocketAddr>().map_err(|e| {
-                ClusterError::Config(format!("invalid peer '{raw}': {e}"))
-            })?;
+            let addr = raw
+                .parse::<SocketAddr>()
+                .map_err(|e| ClusterError::Config(format!("invalid peer '{raw}': {e}")))?;
             parsed.push(addr);
         }
         Ok(Self { peers: parsed })
@@ -30,7 +30,7 @@ impl StaticDiscovery {
 
     /// Build directly from already-parsed addresses (tests).
     #[must_use]
-    pub fn from_addrs(peers: Vec<SocketAddr>) -> Self {
+    pub const fn from_addrs(peers: Vec<SocketAddr>) -> Self {
         Self { peers }
     }
 }
@@ -52,11 +52,8 @@ mod tests {
 
     #[tokio::test]
     async fn parses_and_returns_peers() {
-        let plugin = StaticDiscovery::new(&[
-            "127.0.0.1:3322".into(),
-            "10.0.0.1:3322".into(),
-        ])
-        .unwrap();
+        let plugin =
+            StaticDiscovery::new(&["127.0.0.1:3322".into(), "10.0.0.1:3322".into()]).unwrap();
         let peers = plugin.discover().await.unwrap();
         assert_eq!(peers.len(), 2);
     }

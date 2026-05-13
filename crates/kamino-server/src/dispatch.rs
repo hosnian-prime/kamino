@@ -30,12 +30,15 @@ pub(crate) struct ServerContext {
 
 impl std::fmt::Debug for ServerContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `client` and `metrics` are `dyn` / `Arc` and have no useful Debug
+        // payload at this level; skipping them keeps the formatter cheap and
+        // log-safe.
         f.debug_struct("ServerContext")
             .field("password_set", &!self.password.is_empty())
             .field("version", &self.version)
             .field("id", &self.id)
             .field("member_provider", &self.member_provider.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

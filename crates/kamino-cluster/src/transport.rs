@@ -50,7 +50,7 @@ impl UdpTransport {
 
     /// Construct from an already-bound socket (useful in tests).
     #[must_use]
-    pub fn from_socket(socket: Arc<UdpSocket>) -> Self {
+    pub const fn from_socket(socket: Arc<UdpSocket>) -> Self {
         Self { socket }
     }
 }

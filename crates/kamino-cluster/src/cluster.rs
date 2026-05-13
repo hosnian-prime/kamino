@@ -48,7 +48,7 @@ pub struct ClusterDeps {
 }
 
 /// Running cluster.
-#[allow(missing_debug_implementations)]
+#[allow(missing_debug_implementations, clippy::struct_field_names)]
 pub struct Cluster {
     view: MembershipView,
     queue: Arc<GossipQueue>,
@@ -68,7 +68,7 @@ pub struct Cluster {
 impl Cluster {
     /// Build a cluster but do not start the background tasks. Useful for
     /// tests that drive the SWIM driver manually.
-    pub fn assemble(deps: ClusterDeps) -> ClusterResult<Self> {
+    pub fn assemble(deps: ClusterDeps) -> Self {
         let view = MembershipView::bootstrap(deps.local.clone());
         let queue = Arc::new(GossipQueue::with_capacity(256));
         // Seed the queue with our own Alive announcement so the first probe
@@ -77,7 +77,7 @@ impl Cluster {
             crate::message::alive_for(&deps.local, view.local_incarnation()),
             1,
         );
-        Ok(Self {
+        Self {
             view,
             queue,
             transport: deps.transport,
@@ -91,7 +91,7 @@ impl Cluster {
             swim_config: deps.config.swim.clone(),
             discovery_config: deps.config.discovery.clone(),
             leave_timeout: deps.config.discovery.leave_timeout,
-        })
+        }
     }
 
     /// Assemble the cluster, run `join()` (best-effort, capped by
@@ -113,7 +113,7 @@ impl Cluster {
         let bootstrap_timeout = discovery_config.bootstrap_timeout;
         let clock = Arc::clone(&deps.clock);
 
-        let cluster = Arc::new(Self::assemble(deps)?);
+        let cluster = Arc::new(Self::assemble(deps));
 
         // Best-effort join. Respect bootstrap_timeout as a hard ceiling so a
         // misconfigured peer list cannot block start-up forever.
@@ -163,8 +163,8 @@ impl Cluster {
         self.view.clone()
     }
 
-    /// Build a SwimDriver for the assembled cluster. Caller decides whether
-    /// to run the probe + receive loops or test them in isolation.
+    /// Build a [`SwimDriver`] for the assembled cluster. Caller decides
+    /// whether to run the probe + receive loops or test them in isolation.
     pub fn driver(
         &self,
         clock: Arc<dyn Clock>,

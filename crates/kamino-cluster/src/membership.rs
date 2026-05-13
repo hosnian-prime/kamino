@@ -74,12 +74,13 @@ pub enum ApplyOutcome {
     /// State or incarnation of an existing member advanced.
     Updated,
     /// We learned that a remote node thinks we are suspect/dead — caller
-    /// must bump local_incarnation and broadcast a refuting Alive.
+    /// must bump `local_incarnation` and broadcast a refuting Alive.
     SelfRefutationNeeded,
 }
 
 impl MembershipView {
     /// Build a fresh view containing only the local node as `Alive`.
+    #[allow(clippy::needless_pass_by_value)] // `Member` is cloned into the view
     pub fn bootstrap(local: Member) -> Self {
         let view = Self::default();
         {
@@ -213,10 +214,12 @@ impl MembershipView {
             GossipEvent::Suspect {
                 id, incarnation, ..
             } => apply_suspect(&mut inner, id, incarnation, now_ns, suspicion_timeout_ns),
+            // A graceful Leave is observationally indistinguishable from
+            // Dead — same absorbing state, same incarnation gate.
             GossipEvent::Dead {
                 id, incarnation, ..
-            } => apply_dead(&mut inner, id, incarnation),
-            GossipEvent::Leave { id, incarnation } => apply_dead(&mut inner, id, incarnation),
+            }
+            | GossipEvent::Leave { id, incarnation } => apply_dead(&mut inner, id, incarnation),
         }
     }
 
@@ -539,7 +542,7 @@ mod tests {
     fn coordinator_tiebreaker_uses_id() {
         let view = MembershipView::bootstrap(mk_member(5, 100, 3320));
         for id in [3_u64, 7, 1, 9] {
-            let m = mk_member(id, 100, 3320 + id as u16 * 2);
+            let m = mk_member(id, 100, 3320 + u16::try_from(id).unwrap() * 2);
             view.apply(
                 &GossipEvent::Alive {
                     id: m.id,

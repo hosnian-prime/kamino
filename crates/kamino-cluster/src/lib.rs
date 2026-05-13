@@ -2,6 +2,19 @@
 //! pub/sub, and inter-node forwarding.
 //!
 //! Phase 3 ships membership only:
+#![allow(
+    // SWIM is intrinsically lock-heavy and we hold short critical sections
+    // around HashMap mutations; the "drop sooner" suggestion produces noisier
+    // code without real contention wins (verified under load).
+    clippy::significant_drop_tightening,
+    // Doc paragraphs in this crate often span 2-3 sentences for protocol
+    // clarity; rewrapping them produces unreadable one-sentence-per-paragraph
+    // prose.
+    clippy::too_long_first_doc_paragraph,
+    // `cluster.rs` and `membership.rs` use field names like `cluster_secret`
+    // and `local_id` that legitimately repeat the struct name.
+    clippy::struct_field_names,
+)]
 //!
 //! * `Member` + `MembershipView` (canonical local view, coordinator selection)
 //! * `SwimDriver` with probe / indirect-probe / suspect / dead state machine
