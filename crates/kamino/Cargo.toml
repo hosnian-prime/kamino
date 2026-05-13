@@ -27,3 +27,15 @@ kamino-cluster = { workspace = true }
 kamino-observability = { workspace = true }
 kamino-client = { workspace = true }
 kamino-server = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+async-trait = { workspace = true }
+kamino-client = { workspace = true }
+kamino-storage = { workspace = true }
+kamino-core = { workspace = true }
+regex = { workspace = true }
