@@ -251,6 +251,7 @@ overlay_struct!(CoreOverlay {
     replication_mode: crate::config::ReplicationMode,
     read_repair: bool,
     load_factor: f64,
+    virtual_nodes_per_member: u32,
 });
 
 impl CoreOverlay {
@@ -270,6 +271,7 @@ impl CoreOverlay {
         set!(replication_mode);
         set!(read_repair);
         set!(load_factor);
+        set!(virtual_nodes_per_member);
     }
 }
 

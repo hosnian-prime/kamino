@@ -83,6 +83,25 @@ pub enum Command {
     // --- Cluster (Phase 3+) ---
     /// `CLUSTER.MEMBERS` — returns the local view of cluster members.
     ClusterMembers,
+    /// `CLUSTER.ROUTINGTABLE` — returns the local routing table
+    /// (`MessagePack` payload wrapped in a single bulk string), or `+NORT`
+    /// if no table has been built yet.
+    ClusterRoutingTable,
+    /// `CLUSTER.READY` — returns `+OK` iff the node has joined SWIM, has a
+    /// routing table with signature > 0, and member count meets the quorum.
+    /// Suitable for Kubernetes readiness probes.
+    ClusterReady,
+    /// `INTERNAL.NODE.UPDATEROUTING <msgpack-bytes>` — peer-to-peer routing
+    /// table push. The receiver applies the table via the signature-clock
+    /// gate; stale (`signature <= local`) tables are accepted-as-rejected
+    /// with a `+STALE` reply, schema mismatches with a `+SCHEMA` reply,
+    /// and applied tables with `+OK`.
+    InternalNodeUpdateRouting { table: Bytes },
+    /// `INTERNAL.NODE.LENGTHOFPART <partition_id>` — partition-size query
+    /// used by the Phase 6 balancer. The Phase 4A server replies with `0`
+    /// since the storage engine isn't partition-aware yet; the wire shape
+    /// is frozen now so future versions add semantics, not arguments.
+    InternalNodeLengthOfPart { partition_id: u32 },
 }
 
 /// Optional flags for `DM.PUT`.
@@ -175,6 +194,10 @@ impl Command {
             b"DM.DESTROY" => parse_dm_destroy(args),
             b"DM.SCAN" => parse_dm_scan(args),
             b"CLUSTER.MEMBERS" => parse_cluster_members(&args),
+            b"CLUSTER.ROUTINGTABLE" => parse_cluster_routing_table(&args),
+            b"CLUSTER.READY" => parse_cluster_ready(&args),
+            b"INTERNAL.NODE.UPDATEROUTING" => parse_internal_update_routing(args),
+            b"INTERNAL.NODE.LENGTHOFPART" => parse_internal_length_of_part(args),
             _ => Err(CommandError::UnknownCommand(
                 String::from_utf8_lossy(verb_lower).into_owned(),
             )),
@@ -291,6 +314,16 @@ impl Command {
                 v
             }
             Self::ClusterMembers => vec![bulk("CLUSTER.MEMBERS")],
+            Self::ClusterRoutingTable => vec![bulk("CLUSTER.ROUTINGTABLE")],
+            Self::ClusterReady => vec![bulk("CLUSTER.READY")],
+            Self::InternalNodeUpdateRouting { table } => vec![
+                bulk("INTERNAL.NODE.UPDATEROUTING"),
+                Frame::Bulk(BulkString::from_bytes(table.clone())),
+            ],
+            Self::InternalNodeLengthOfPart { partition_id } => vec![
+                bulk("INTERNAL.NODE.LENGTHOFPART"),
+                bulk(&partition_id.to_string()),
+            ],
         };
         Frame::Array(Some(parts))
     }
@@ -545,6 +578,33 @@ fn parse_stats(args: &[Bytes]) -> Result<Command, CommandError> {
 fn parse_cluster_members(args: &[Bytes]) -> Result<Command, CommandError> {
     require_exact(args, "CLUSTER.MEMBERS", 0)?;
     Ok(Command::ClusterMembers)
+}
+
+fn parse_cluster_routing_table(args: &[Bytes]) -> Result<Command, CommandError> {
+    require_exact(args, "CLUSTER.ROUTINGTABLE", 0)?;
+    Ok(Command::ClusterRoutingTable)
+}
+
+fn parse_cluster_ready(args: &[Bytes]) -> Result<Command, CommandError> {
+    require_exact(args, "CLUSTER.READY", 0)?;
+    Ok(Command::ClusterReady)
+}
+
+fn parse_internal_update_routing(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_exact(&args, "INTERNAL.NODE.UPDATEROUTING", 1)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    let table = iter.next().unwrap();
+    Ok(Command::InternalNodeUpdateRouting { table })
+}
+
+fn parse_internal_length_of_part(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_exact(&args, "INTERNAL.NODE.LENGTHOFPART", 1)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    let partition_raw = iter.next().unwrap();
+    let partition_id = parse_int(&partition_raw, "INTERNAL.NODE.LENGTHOFPART", "partition_id")?;
+    Ok(Command::InternalNodeLengthOfPart { partition_id })
 }
 
 fn parse_dm_put(args: Vec<Bytes>) -> Result<Command, CommandError> {
@@ -1265,6 +1325,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_cluster_routing_table() {
+        let frame = arr(&[b"CLUSTER.ROUTINGTABLE"]);
+        assert_eq!(Command::parse(frame).unwrap(), Command::ClusterRoutingTable);
+    }
+
+    #[test]
+    fn parse_cluster_ready() {
+        let frame = arr(&[b"CLUSTER.READY"]);
+        assert_eq!(Command::parse(frame).unwrap(), Command::ClusterReady);
+    }
+
+    #[test]
+    fn parse_internal_update_routing_roundtrip() {
+        let cmd = Command::InternalNodeUpdateRouting {
+            table: Bytes::from_static(b"\x82\xa4ping\x01"),
+        };
+        assert_eq!(Command::parse(cmd.to_frame()).unwrap(), cmd);
+    }
+
+    #[test]
+    fn parse_internal_update_routing_wrong_arity() {
+        let frame = arr(&[b"INTERNAL.NODE.UPDATEROUTING"]);
+        assert_matches!(Command::parse(frame), Err(CommandError::WrongArity { .. }));
+    }
+
+    #[test]
+    fn parse_internal_length_of_part_roundtrip() {
+        let cmd = Command::InternalNodeLengthOfPart { partition_id: 42 };
+        assert_eq!(Command::parse(cmd.to_frame()).unwrap(), cmd);
+    }
+
+    #[test]
+    fn parse_internal_length_of_part_bad_int() {
+        let frame = arr(&[b"INTERNAL.NODE.LENGTHOFPART", b"abc"]);
+        assert_matches!(
+            Command::parse(frame),
+            Err(CommandError::InvalidArgument { .. })
+        );
+    }
+
+    #[test]
     fn parse_unknown_verb() {
         let frame = arr(&[b"NOPE"]);
         assert_matches!(Command::parse(frame), Err(CommandError::UnknownCommand(s)) if s == "NOPE");
@@ -1493,6 +1594,12 @@ mod tests {
                     cursor,
                     options,
                 }),
+            Just(Command::ClusterMembers),
+            Just(Command::ClusterRoutingTable),
+            Just(Command::ClusterReady),
+            bytes_strategy().prop_map(|table| Command::InternalNodeUpdateRouting { table }),
+            any::<u32>()
+                .prop_map(|partition_id| Command::InternalNodeLengthOfPart { partition_id }),
         ]
     }
 

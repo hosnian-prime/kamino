@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use kamino_core::clock::Clock;
 use kamino_core::config::Config;
+use kamino_core::hasher::{Hasher, XxHasher};
 use kamino_core::ids::MemberId;
 use kamino_core::member::Member;
 use parking_lot::Mutex;
@@ -27,10 +28,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::discovery::DiscoveryPlugin;
-use crate::error::ClusterResult;
+use crate::error::{ClusterError, ClusterResult};
 use crate::gossip::GossipQueue;
 use crate::join::{self, JoinParams};
 use crate::membership::MembershipView;
+use crate::routing::coordinator::{
+    CoordinatorParams, LocalOnlyPusher, RoutingPusher, SignatureClock, run_coordinator_loop,
+};
+use crate::routing::store::{ApplyRoutingOutcome, RoutingTableStore};
+use crate::routing::table::RoutingTable;
 use crate::swim::{SwimDriver, run_probe_loop, run_receive_loop};
 use crate::transport::Transport;
 
@@ -45,6 +51,12 @@ pub struct ClusterDeps {
     /// correct RESP `addr` (Phase 2 server) — the cluster runtime only
     /// owns the SWIM discovery socket.
     pub local: Member,
+    /// Hash function for the consistent-hash ring. `None` selects the
+    /// default [`XxHasher`].
+    pub hasher: Option<Arc<dyn Hasher>>,
+    /// Inter-node routing-table pusher. `None` uses [`LocalOnlyPusher`]
+    /// (Phase 4A default; the real Forwarder-based pusher lands in 4B).
+    pub routing_pusher: Option<Arc<dyn RoutingPusher>>,
 }
 
 /// Running cluster.
@@ -63,6 +75,13 @@ pub struct Cluster {
     swim_config: kamino_core::config::SwimConfig,
     discovery_config: kamino_core::config::DiscoveryConfig,
     leave_timeout: std::time::Duration,
+    routing_store: Arc<RoutingTableStore>,
+    routing_signature: Arc<SignatureClock>,
+    hasher: Arc<dyn Hasher>,
+    routing_pusher: Arc<dyn RoutingPusher>,
+    core_config: kamino_core::config::CoreConfig,
+    routing_config: kamino_core::config::RoutingConfig,
+    member_count_quorum: u32,
 }
 
 impl Cluster {
@@ -77,6 +96,10 @@ impl Cluster {
             crate::message::alive_for(&deps.local, view.local_incarnation()),
             1,
         );
+        let hasher: Arc<dyn Hasher> = deps.hasher.unwrap_or_else(|| Arc::new(XxHasher));
+        let routing_pusher: Arc<dyn RoutingPusher> = deps
+            .routing_pusher
+            .unwrap_or_else(|| Arc::new(LocalOnlyPusher));
         Self {
             view,
             queue,
@@ -91,6 +114,13 @@ impl Cluster {
             swim_config: deps.config.swim.clone(),
             discovery_config: deps.config.discovery.clone(),
             leave_timeout: deps.config.discovery.leave_timeout,
+            routing_store: Arc::new(RoutingTableStore::new()),
+            routing_signature: SignatureClock::new(),
+            hasher,
+            routing_pusher,
+            core_config: deps.config.core.clone(),
+            routing_config: deps.config.routing.clone(),
+            member_count_quorum: deps.config.core.member_count_quorum,
         }
     }
 
@@ -151,12 +181,32 @@ impl Cluster {
         let probe_handle = tokio::spawn(async move {
             run_probe_loop(probe_driver).await;
         });
+        // Spawn the routing-table coordinator loop. Every node runs it; non-
+        // coordinators short-circuit each tick.
+        let coordinator_params = CoordinatorParams {
+            local_id: cluster.local_id,
+            view: cluster.view.clone(),
+            hasher: Arc::clone(&cluster.hasher),
+            store: Arc::clone(&cluster.routing_store),
+            pusher: Arc::clone(&cluster.routing_pusher),
+            push_interval: cluster.routing_config.push_interval,
+            partition_count: cluster.core_config.partition_count,
+            virtual_nodes_per_member: cluster.core_config.virtual_nodes_per_member,
+            load_factor: cluster.core_config.load_factor,
+            replica_count: cluster.core_config.replica_count,
+            cancel: cluster.cancel.clone(),
+        };
+        let sig = Arc::clone(&cluster.routing_signature);
+        let coord_handle = tokio::spawn(async move {
+            run_coordinator_loop(coordinator_params, sig).await;
+        });
         {
             let mut tasks = cluster.tasks.lock();
             tasks.push(recv_handle);
             tasks.push(probe_handle);
+            tasks.push(coord_handle);
         }
-        debug!("cluster SWIM loops spawned");
+        debug!("cluster SWIM + routing loops spawned");
         Ok(cluster)
     }
 
@@ -262,6 +312,66 @@ impl Cluster {
         Arc::clone(&self.clock)
     }
 
+    /// Shared routing-table store. Cheap clone.
+    #[must_use]
+    pub fn routing_store(&self) -> Arc<RoutingTableStore> {
+        Arc::clone(&self.routing_store)
+    }
+
+    /// Current routing signature (`0` if no table has been seen yet).
+    #[must_use]
+    pub fn routing_signature(&self) -> u64 {
+        self.routing_store.signature()
+    }
+
+    /// `member_count_quorum` from `[core]`.
+    #[must_use]
+    pub const fn member_count_quorum(&self) -> u32 {
+        self.member_count_quorum
+    }
+
+    /// Apply an `INTERNAL.NODE.UPDATEROUTING` payload. Returns the outcome
+    /// (`Accepted` / `Stale` / `UnsupportedSchema`). The decoder is tolerant
+    /// of unknown fields per `docs/15-compatibility.md`.
+    pub fn apply_routing_update(&self, bytes: &[u8]) -> ClusterResult<ApplyRoutingOutcome> {
+        let table = RoutingTable::from_msgpack(bytes)?;
+        // If a peer's table has a higher signature than ours, advance the
+        // local signature clock so any future build we do as coordinator
+        // doesn't collide with it.
+        let incoming_sig = table.signature;
+        let outcome = self.routing_store.apply(table);
+        if outcome == ApplyRoutingOutcome::Accepted {
+            // Best-effort: bump the local clock so a freshly-promoted
+            // coordinator continues monotonically.
+            self.bump_signature_to_at_least(incoming_sig);
+        }
+        Ok(outcome)
+    }
+
+    fn bump_signature_to_at_least(&self, target: u64) {
+        while self.routing_signature.current() < target {
+            self.routing_signature.next();
+        }
+    }
+
+    /// True iff every readiness gate (`docs/06-network-protocol.md`
+    /// `CLUSTER.READY`) is satisfied:
+    /// 1. SWIM membership is non-empty (we joined).
+    /// 2. A routing table with `signature > 0` is stored.
+    /// 3. Live member count satisfies `member_count_quorum`.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        if !self.routing_store.is_populated() {
+            return false;
+        }
+        if self.routing_store.signature() == 0 {
+            return false;
+        }
+        let live = self.view.live_count();
+        let quorum = self.member_count_quorum as usize;
+        live >= quorum
+    }
+
     /// Gracefully leave the cluster: broadcast a Leave gossip event,
     /// wait `leave_timeout`, then cancel and join all tasks.
     pub async fn shutdown(self: Arc<Self>) -> ClusterResult<()> {
@@ -327,6 +437,44 @@ impl MemberProvider for Cluster {
             .iter()
             .map(MemberSummary::from)
             .collect()
+    }
+}
+
+/// Trait the RESP server calls for `CLUSTER.ROUTINGTABLE`, `CLUSTER.READY`,
+/// and `INTERNAL.NODE.UPDATEROUTING`.
+///
+/// Standalone-only deployments (no cluster runtime) get a `None` provider on
+/// the server and the handlers respond with sensible single-node defaults.
+pub trait RoutingProvider: Send + Sync {
+    /// Encoded routing table bytes, or `None` if no table has been built yet.
+    fn routing_table_bytes(&self) -> Option<Vec<u8>>;
+
+    /// Apply an `INTERNAL.NODE.UPDATEROUTING` payload.
+    fn apply_routing_update(&self, bytes: &[u8]) -> Result<ApplyRoutingOutcome, ClusterError>;
+
+    /// Readiness gate per `docs/06-network-protocol.md` `CLUSTER.READY`.
+    fn is_ready(&self) -> bool;
+
+    /// Current signature (0 if not populated).
+    fn routing_signature(&self) -> u64;
+}
+
+impl RoutingProvider for Cluster {
+    fn routing_table_bytes(&self) -> Option<Vec<u8>> {
+        let snap = self.routing_store.snapshot()?;
+        snap.to_msgpack().ok()
+    }
+
+    fn apply_routing_update(&self, bytes: &[u8]) -> Result<ApplyRoutingOutcome, ClusterError> {
+        Self::apply_routing_update(self, bytes)
+    }
+
+    fn is_ready(&self) -> bool {
+        Self::is_ready(self)
+    }
+
+    fn routing_signature(&self) -> u64 {
+        Self::routing_signature(self)
     }
 }
 

@@ -115,6 +115,8 @@ fn deps_for(
         discovery,
         clock: Arc::new(SystemClock),
         local,
+        hasher: None,
+        routing_pusher: None,
     }
 }
 
@@ -167,6 +169,8 @@ async fn assemble_only_path_is_independent_of_loops() {
         discovery: Arc::new(StaticDiscovery::from_addrs(Vec::new())),
         clock: Arc::new(SystemClock),
         local,
+        hasher: None,
+        routing_pusher: None,
     };
     let cluster = Cluster::assemble(deps);
     assert_eq!(cluster.snapshot_members().len(), 1);

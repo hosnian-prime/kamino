@@ -34,10 +34,11 @@ pub mod gossip;
 pub mod join;
 pub mod membership;
 pub mod message;
+pub mod routing;
 pub mod swim;
 pub mod transport;
 
-pub use cluster::{Cluster, ClusterDeps, MemberProvider, MemberSummary};
+pub use cluster::{Cluster, ClusterDeps, MemberProvider, MemberSummary, RoutingProvider};
 #[cfg(feature = "discovery-dns")]
 pub use discovery::DnsDiscovery;
 pub use discovery::{DiscoveryPlugin, StaticDiscovery};
@@ -46,5 +47,9 @@ pub use gossip::GossipQueue;
 pub use join::{JOIN_TARGET_SENTINEL, JoinParams, join};
 pub use membership::{ApplyOutcome, MemberEntry, MemberState, MembershipView};
 pub use message::{Envelope, GossipEvent, Incarnation, SwimMessage, alive_for};
+pub use routing::{
+    ApplyRoutingOutcome, Assignment, CoordinatorParams, ROUTING_SCHEMA_VERSION, RoutingTable,
+    RoutingTableStore, SharedRoutingTable, partition_for, run_coordinator_loop,
+};
 pub use swim::{ProbeOutcome, SwimDriver, run_probe_loop, run_receive_loop};
 pub use transport::{Transport, UdpTransport};
