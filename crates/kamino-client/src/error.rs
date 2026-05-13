@@ -90,6 +90,13 @@ pub enum Error {
     /// routing view and retries once before surfacing this to the caller.
     #[error("MOVED {partition} {addr}")]
     Moved { partition: u32, addr: String },
+
+    /// `Subscription::recv` was called after the underlying registry
+    /// dropped this connection's sender (service shut down, peer
+    /// connection cleaned up, or the [`crate::PubSub`] handle was
+    /// dropped). Phase 7 — `docs/11-pubsub.md` "Delivery Guarantees".
+    #[error("pub/sub subscription closed")]
+    SubscriptionClosed,
 }
 
 impl From<kamino_storage::Error> for Error {

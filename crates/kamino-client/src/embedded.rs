@@ -55,6 +55,11 @@ impl std::fmt::Debug for EmbeddedDeps {
 pub struct EmbeddedClient {
     deps: EmbeddedDeps,
     dmaps: RwLock<BTreeMap<String, Arc<EmbeddedDMap>>>,
+    /// Phase 7 pub/sub registry shared across every `new_pubsub()` call
+    /// on this client. Lazy-initialised so non-pubsub deployments don't
+    /// pay for it. `Arc` so callers can share the service with the
+    /// umbrella `Kamino` builder for the standalone-with-cluster path.
+    pubsub: Arc<kamino_cluster::PubSubService>,
 }
 
 impl EmbeddedClient {
@@ -64,7 +69,17 @@ impl EmbeddedClient {
         Arc::new(Self {
             deps,
             dmaps: RwLock::new(BTreeMap::new()),
+            pubsub: Arc::new(kamino_cluster::PubSubService::new()),
         })
+    }
+
+    /// Shared pub/sub service. The umbrella `Kamino` builder hands the
+    /// same `Arc` to the cluster runtime when running in clustered mode,
+    /// so cluster-events publication and in-process subscribers share
+    /// a single registry.
+    #[must_use]
+    pub fn pubsub_service(&self) -> Arc<kamino_cluster::PubSubService> {
+        Arc::clone(&self.pubsub)
     }
 
     /// Get-or-create a DMap. Used by both the `Client` trait and the umbrella
@@ -201,6 +216,15 @@ impl Client for EmbeddedClient {
             }
         }
         Ok(applied)
+    }
+
+    fn new_pubsub(
+        &self,
+        _options: crate::pubsub::PubSubOptions,
+    ) -> Result<Arc<dyn crate::pubsub::PubSub>> {
+        Ok(Arc::new(crate::pubsub::EmbeddedPubSub::new(Arc::clone(
+            &self.pubsub,
+        ))))
     }
 
     async fn cleanup_empty_fragments(&self) -> Result<usize> {

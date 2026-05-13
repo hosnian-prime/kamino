@@ -36,6 +36,7 @@ pub mod gossip;
 pub mod join;
 pub mod membership;
 pub mod message;
+pub mod pubsub;
 pub mod routing;
 pub mod swim;
 pub mod transport;
@@ -45,8 +46,8 @@ pub use balancer::{
     MigrationTransport, OrphanSink, TracingEventsSink, run_balancer_loop, run_tick,
 };
 pub use cluster::{
-    Cluster, ClusterDeps, FragmentCleaner, MemberProvider, MemberSummary, ReplicationSettings,
-    RoutingProvider,
+    Cluster, ClusterDeps, FragmentCleaner, MemberProvider, MemberSummary, PubSubEventsSink,
+    ReplicationSettings, RoutingProvider,
 };
 #[cfg(feature = "discovery-dns")]
 pub use discovery::DnsDiscovery;
@@ -57,6 +58,9 @@ pub use gossip::GossipQueue;
 pub use join::{JOIN_TARGET_SENTINEL, JoinParams, join};
 pub use membership::{ApplyOutcome, MemberEntry, MemberState, MembershipView};
 pub use message::{Envelope, GossipEvent, Incarnation, SwimMessage, alive_for};
+pub use pubsub::{
+    DeliveredMessage, LocalPubSubProvider, PubSubProvider, PubSubService, SubAck, pattern_matches,
+};
 pub use routing::{
     ApplyRoutingOutcome, Assignment, CoordinatorParams, ROUTING_SCHEMA_VERSION, RoutingTable,
     RoutingTableStore, SharedRoutingTable, partition_for, run_coordinator_loop,

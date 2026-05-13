@@ -15,6 +15,7 @@ workspace = true
 kamino-core = { workspace = true }
 kamino-storage = { workspace = true }
 kamino-protocol = { workspace = true }
+kamino-cluster = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

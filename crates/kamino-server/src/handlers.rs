@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kamino_client::{Client, DMap, DMapOptions, Error as ClientError, PutOptions, ScanOptions};
-use kamino_cluster::RoutingProvider;
+use kamino_cluster::{PubSubProvider, RoutingProvider, SubAck};
 use kamino_core::ReplicationMode;
 use kamino_protocol::{BulkString, Frame, HelloArgs};
 
@@ -1049,4 +1049,274 @@ pub(crate) async fn dm_scan(
         Frame::Array(Some(items)),
     ];
     Response::ok(Frame::Array(Some(pair)))
+}
+
+// --- Phase 7 pub/sub handlers -----------------------------------------------
+
+/// `RESP3`-aware single-message-or-array reply. SUBSCRIBE/PSUBSCRIBE/etc
+/// always reply with multiple acks (one per channel/pattern) so the
+/// connection loop sends every entry as a separate frame.
+#[derive(Debug)]
+pub(crate) struct MultiResponse {
+    pub(crate) frames: Vec<Frame>,
+    pub(crate) outcome: HandlerOutcome,
+}
+
+impl MultiResponse {
+    pub(crate) const fn ok(frames: Vec<Frame>) -> Self {
+        Self {
+            frames,
+            outcome: HandlerOutcome::Continue,
+        }
+    }
+}
+
+const NO_PUBSUB_PROVIDER: &str = "ERR pub/sub not enabled on this server";
+
+fn require_pubsub(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+) -> Result<&Arc<dyn PubSubProvider>, Frame> {
+    provider.ok_or_else(|| Frame::Error(NO_PUBSUB_PROVIDER.into()))
+}
+
+fn ensure_conn_registered(
+    provider: &Arc<dyn PubSubProvider>,
+    state: &mut ConnState,
+    pubsub_sender: &tokio::sync::mpsc::Sender<kamino_cluster::DeliveredMessage>,
+) -> u64 {
+    if let Some(id) = state.pub_sub_id {
+        return id;
+    }
+    let id = provider.allocate_conn_id();
+    provider.register_conn(id, pubsub_sender.clone());
+    state.pub_sub_id = Some(id);
+    id
+}
+
+fn build_sub_ack(kind: &str, ack: &SubAck) -> Frame {
+    let channel = if ack.channel.is_empty() {
+        Frame::Bulk(BulkString::null())
+    } else {
+        Frame::Bulk(BulkString::from_bytes(ack.channel.clone()))
+    };
+    Frame::Array(Some(vec![
+        Frame::Bulk(BulkString::from(kind)),
+        channel,
+        Frame::Integer(i64::try_from(ack.total_subscriptions).unwrap_or(i64::MAX)),
+    ]))
+}
+
+pub(crate) fn subscribe(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+    state: &mut ConnState,
+    sender: &tokio::sync::mpsc::Sender<kamino_cluster::DeliveredMessage>,
+    channels: &[Bytes],
+) -> MultiResponse {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => {
+            return MultiResponse::ok(vec![f]);
+        }
+    };
+    let id = ensure_conn_registered(provider, state, sender);
+    let acks = provider.subscribe(id, channels);
+    state.pub_sub_count = acks
+        .last()
+        .map_or(state.pub_sub_count, |a| a.total_subscriptions);
+    let frames = acks.iter().map(|a| build_sub_ack("subscribe", a)).collect();
+    MultiResponse::ok(frames)
+}
+
+pub(crate) fn psubscribe(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+    state: &mut ConnState,
+    sender: &tokio::sync::mpsc::Sender<kamino_cluster::DeliveredMessage>,
+    patterns: &[Bytes],
+) -> MultiResponse {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => {
+            return MultiResponse::ok(vec![f]);
+        }
+    };
+    let id = ensure_conn_registered(provider, state, sender);
+    let acks = provider.psubscribe(id, patterns);
+    state.pub_sub_count = acks
+        .last()
+        .map_or(state.pub_sub_count, |a| a.total_subscriptions);
+    let frames = acks
+        .iter()
+        .map(|a| build_sub_ack("psubscribe", a))
+        .collect();
+    MultiResponse::ok(frames)
+}
+
+pub(crate) fn unsubscribe(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+    state: &mut ConnState,
+    channels: &[Bytes],
+) -> MultiResponse {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => return MultiResponse::ok(vec![f]),
+    };
+    let Some(id) = state.pub_sub_id else {
+        // Not subscribed to anything — emit a single null-channel ack with
+        // total=0 per Redis convention.
+        let ack = SubAck {
+            channel: Bytes::new(),
+            is_pattern: false,
+            total_subscriptions: 0,
+        };
+        return MultiResponse::ok(vec![build_sub_ack("unsubscribe", &ack)]);
+    };
+    let filter = if channels.is_empty() {
+        None
+    } else {
+        Some(channels)
+    };
+    let acks = provider.unsubscribe(id, filter);
+    state.pub_sub_count = acks
+        .last()
+        .map_or(state.pub_sub_count, |a| a.total_subscriptions);
+    let frames = acks
+        .iter()
+        .map(|a| build_sub_ack("unsubscribe", a))
+        .collect();
+    MultiResponse::ok(frames)
+}
+
+pub(crate) fn punsubscribe(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+    state: &mut ConnState,
+    patterns: &[Bytes],
+) -> MultiResponse {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => return MultiResponse::ok(vec![f]),
+    };
+    let Some(id) = state.pub_sub_id else {
+        let ack = SubAck {
+            channel: Bytes::new(),
+            is_pattern: true,
+            total_subscriptions: 0,
+        };
+        return MultiResponse::ok(vec![build_sub_ack("punsubscribe", &ack)]);
+    };
+    let filter = if patterns.is_empty() {
+        None
+    } else {
+        Some(patterns)
+    };
+    let acks = provider.punsubscribe(id, filter);
+    state.pub_sub_count = acks
+        .last()
+        .map_or(state.pub_sub_count, |a| a.total_subscriptions);
+    let frames = acks
+        .iter()
+        .map(|a| build_sub_ack("punsubscribe", a))
+        .collect();
+    MultiResponse::ok(frames)
+}
+
+pub(crate) async fn publish(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+    channel: Bytes,
+    message: Bytes,
+) -> Response {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => return Response::ok(f),
+    };
+    let count = provider.publish(channel, message).await;
+    Response::ok(Frame::Integer(i64::try_from(count).unwrap_or(i64::MAX)))
+}
+
+pub(crate) fn internal_node_publish(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+    channel: &Bytes,
+    message: &Bytes,
+) -> Response {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => return Response::ok(f),
+    };
+    let name = String::from_utf8_lossy(channel).into_owned();
+    let count = provider.publish_local(&name, message);
+    Response::ok(Frame::Integer(i64::try_from(count).unwrap_or(i64::MAX)))
+}
+
+pub(crate) fn pubsub_channels(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+    pattern: Option<&Bytes>,
+) -> Response {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => return Response::ok(f),
+    };
+    let pat = pattern.map(|p| String::from_utf8_lossy(p).into_owned());
+    let chans = provider.pubsub_channels(pat.as_deref());
+    let items = chans
+        .into_iter()
+        .map(|c| Frame::Bulk(BulkString::from(c)))
+        .collect();
+    Response::ok(Frame::Array(Some(items)))
+}
+
+pub(crate) fn pubsub_numsub(
+    provider: Option<&Arc<dyn PubSubProvider>>,
+    channels: &[Bytes],
+) -> Response {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => return Response::ok(f),
+    };
+    let pairs = provider.pubsub_numsub(channels);
+    let mut items = Vec::with_capacity(pairs.len() * 2);
+    for (name, count) in pairs {
+        items.push(Frame::Bulk(BulkString::from_bytes(name)));
+        items.push(Frame::Integer(i64::try_from(count).unwrap_or(i64::MAX)));
+    }
+    Response::ok(Frame::Array(Some(items)))
+}
+
+pub(crate) fn pubsub_numpat(provider: Option<&Arc<dyn PubSubProvider>>) -> Response {
+    let provider = match require_pubsub(provider) {
+        Ok(p) => p,
+        Err(f) => return Response::ok(f),
+    };
+    Response::ok(Frame::Integer(
+        i64::try_from(provider.pubsub_numpat()).unwrap_or(i64::MAX),
+    ))
+}
+
+/// Build the wire frame for a delivered pub/sub message. Uses RESP3 push
+/// frames when the connection negotiated RESP3, falling back to a
+/// plain RESP array on RESP2 (the Redis legacy shape).
+pub(crate) fn deliver_message_frame(
+    msg: &kamino_cluster::DeliveredMessage,
+    version: kamino_protocol::ProtocolVersion,
+) -> Frame {
+    use kamino_protocol::ProtocolVersion;
+    let items = msg.pattern.as_ref().map_or_else(
+        || {
+            vec![
+                Frame::Bulk(BulkString::from("message")),
+                Frame::Bulk(BulkString::from(msg.channel.as_str())),
+                Frame::Bulk(BulkString::from_bytes(msg.payload.clone())),
+            ]
+        },
+        |p| {
+            vec![
+                Frame::Bulk(BulkString::from("pmessage")),
+                Frame::Bulk(BulkString::from(p.as_str())),
+                Frame::Bulk(BulkString::from(msg.channel.as_str())),
+                Frame::Bulk(BulkString::from_bytes(msg.payload.clone())),
+            ]
+        },
+    );
+    match version {
+        ProtocolVersion::Resp3 => Frame::Push(items),
+        ProtocolVersion::Resp2 => Frame::Array(Some(items)),
+    }
 }

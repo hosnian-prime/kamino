@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use kamino_client::Client;
-use kamino_cluster::{Cluster, MemberProvider, RoutingProvider};
+use kamino_cluster::{Cluster, MemberProvider, PubSubProvider, RoutingProvider};
 use kamino_core::{Config, Mode};
 use rand::RngCore;
 use tokio::net::TcpListener;
@@ -102,7 +102,30 @@ impl Server {
         if config.mode != Mode::Standalone {
             return Err(ServerError::WrongMode(config.mode.as_str()));
         }
-        Self::bind_internal(config, client, None, None).await
+        // Phase 7: a standalone server still gets a local pub/sub registry
+        // — there's no cluster fan-out, but `SUBSCRIBE`/`PUBLISH` between
+        // clients of the same node must work.
+        let pubsub_service = Arc::new(kamino_cluster::PubSubService::new());
+        let pubsub_provider: Arc<dyn PubSubProvider> =
+            Arc::new(kamino_cluster::LocalPubSubProvider::new(pubsub_service));
+        Self::bind_internal(config, client, None, None, Some(pubsub_provider)).await
+    }
+
+    /// Like [`Server::bind`] but shares the supplied [`PubSubService`]
+    /// with the caller. The umbrella `Kamino::serve` passes the embedded
+    /// client's service here so RESP subscribers and in-process
+    /// subscribers see the same registry.
+    pub async fn bind_with_pubsub_service(
+        config: &Config,
+        client: Arc<dyn Client>,
+        service: Arc<kamino_cluster::PubSubService>,
+    ) -> Result<Self, ServerError> {
+        if config.mode != Mode::Standalone {
+            return Err(ServerError::WrongMode(config.mode.as_str()));
+        }
+        let pubsub_provider: Arc<dyn PubSubProvider> =
+            Arc::new(kamino_cluster::LocalPubSubProvider::new(service));
+        Self::bind_internal(config, client, None, None, Some(pubsub_provider)).await
     }
 
     /// Like [`Server::bind`] but registers `cluster` as both the
@@ -122,6 +145,7 @@ impl Server {
         }
         let member_provider: Arc<dyn MemberProvider> = Arc::clone(&cluster) as _;
         let routing_provider: Arc<dyn RoutingProvider> = Arc::clone(&cluster) as _;
+        let pubsub_provider: Arc<dyn PubSubProvider> = Arc::clone(&cluster) as _;
         // Phase 6: hand the cluster a `MigrationSource` so its balancer loop
         // can drive `INTERNAL.NODE.MOVEFRAGMENT` against this server's
         // storage. The cluster owns the JoinHandle and the cancel token.
@@ -132,13 +156,35 @@ impl Server {
             Arc::clone(&migration_adapter) as Arc<dyn kamino_cluster::MigrationSource>;
         let cleaner: Arc<dyn kamino_cluster::FragmentCleaner> =
             Arc::clone(&migration_adapter) as Arc<dyn kamino_cluster::FragmentCleaner>;
-        cluster.spawn_balancer(source, None);
+        // Phase 7: when `[events] enable_cluster_events_channel = true`,
+        // route balancer events into the pub/sub registry so subscribers
+        // of `cluster.events` see them. Otherwise default to the
+        // tracing-only sink.
+        let events_sink: Option<Arc<dyn kamino_cluster::ClusterEventsSink>> =
+            if cluster.events_channel_enabled() {
+                let local_name = cluster.local_member().name;
+                Some(Arc::new(kamino_cluster::PubSubEventsSink::new(
+                    cluster.pubsub(),
+                    local_name,
+                )))
+            } else {
+                None
+            };
+        cluster.spawn_balancer(source, events_sink.clone());
         cluster.spawn_fragment_cleanup(cleaner);
+        // Phase 7: poll membership and publish `node-join` / `node-left`
+        // into `cluster.events`. The poll cadence reuses the SWIM probe
+        // interval — bounding the time between a member transition and
+        // the event being observable on a subscriber.
+        if let Some(sink) = events_sink {
+            cluster.spawn_membership_events(sink, config.swim.probe_interval);
+        }
         Self::bind_internal(
             config,
             client,
             Some(member_provider),
             Some(routing_provider),
+            Some(pubsub_provider),
         )
         .await
     }
@@ -146,6 +192,29 @@ impl Server {
     /// Bind with arbitrary `MemberProvider` / `RoutingProvider` impls. Used
     /// by integration tests that need to inject a stub routing view
     /// (Phase 4 MOVED-retry end-to-end coverage).
+    /// Like [`Server::bind_with_providers`] but with an explicit
+    /// `pubsub_provider`. Used by the Phase 7 cluster-pub/sub e2e tests
+    /// that hand-wire a fan-out provider.
+    pub async fn bind_with_full_providers(
+        config: &Config,
+        client: Arc<dyn Client>,
+        member_provider: Option<Arc<dyn MemberProvider>>,
+        routing_provider: Option<Arc<dyn RoutingProvider>>,
+        pubsub_provider: Option<Arc<dyn PubSubProvider>>,
+    ) -> Result<Self, ServerError> {
+        if config.mode != Mode::Standalone {
+            return Err(ServerError::WrongMode(config.mode.as_str()));
+        }
+        Self::bind_internal(
+            config,
+            client,
+            member_provider,
+            routing_provider,
+            pubsub_provider,
+        )
+        .await
+    }
+
     pub async fn bind_with_providers(
         config: &Config,
         client: Arc<dyn Client>,
@@ -155,7 +224,20 @@ impl Server {
         if config.mode != Mode::Standalone {
             return Err(ServerError::WrongMode(config.mode.as_str()));
         }
-        Self::bind_internal(config, client, member_provider, routing_provider).await
+        // Default to a local pub/sub provider: tests typically don't
+        // exercise pub/sub, but having it wired keeps the dispatcher path
+        // uniform and lets new tests opt in by sending SUBSCRIBE.
+        let pubsub_service = Arc::new(kamino_cluster::PubSubService::new());
+        let pubsub_provider: Arc<dyn PubSubProvider> =
+            Arc::new(kamino_cluster::LocalPubSubProvider::new(pubsub_service));
+        Self::bind_internal(
+            config,
+            client,
+            member_provider,
+            routing_provider,
+            Some(pubsub_provider),
+        )
+        .await
     }
 
     async fn bind_internal(
@@ -163,6 +245,7 @@ impl Server {
         client: Arc<dyn Client>,
         member_provider: Option<Arc<dyn MemberProvider>>,
         routing_provider: Option<Arc<dyn RoutingProvider>>,
+        pubsub_provider: Option<Arc<dyn PubSubProvider>>,
     ) -> Result<Self, ServerError> {
         let addr = SocketAddr::new(config.network.bind_addr, config.network.bind_port);
         let listener = TcpListener::bind(addr)
@@ -181,6 +264,7 @@ impl Server {
             member_provider,
             routing_provider,
             ts_source: Arc::new(crate::replication::TimestampSource::new()),
+            pubsub_provider,
         });
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let settings = ConnSettings {

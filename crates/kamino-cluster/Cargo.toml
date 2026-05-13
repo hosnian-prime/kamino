@@ -46,6 +46,8 @@ turmoil = { workspace = true }
 proptest = { workspace = true }
 assert_matches = { workspace = true }
 tracing = { workspace = true }
+# Phase 7 glob proptest uses regex as an independent reference impl.
+regex = { workspace = true }
 # Self-reference enables the `mock-transport` feature for integration tests so
 # they can use the in-memory `MockTransport`. Documented Cargo pattern; works
 # on stable. An explicit version satisfies `cargo-deny`'s wildcard ban.
