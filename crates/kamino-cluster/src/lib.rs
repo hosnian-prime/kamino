@@ -39,7 +39,9 @@ pub mod routing;
 pub mod swim;
 pub mod transport;
 
-pub use cluster::{Cluster, ClusterDeps, MemberProvider, MemberSummary, RoutingProvider};
+pub use cluster::{
+    Cluster, ClusterDeps, MemberProvider, MemberSummary, ReplicationSettings, RoutingProvider,
+};
 #[cfg(feature = "discovery-dns")]
 pub use discovery::DnsDiscovery;
 pub use discovery::{DiscoveryPlugin, StaticDiscovery};

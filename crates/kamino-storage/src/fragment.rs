@@ -34,6 +34,12 @@ impl Fragment {
         guard.put(hkey, entry).await
     }
 
+    /// LWW-merge variant of [`Self::put`]. See [`StorageEngine::put_lww`].
+    pub async fn put_lww(&self, hkey: u64, entry: &Entry) -> Result<bool> {
+        let mut guard = self.engine.write().await;
+        guard.put_lww(hkey, entry).await
+    }
+
     /// Retrieve the live entry for `hkey`, or `None`.
     pub async fn get(&self, hkey: u64) -> Result<Option<Entry>> {
         let guard = self.engine.read().await;

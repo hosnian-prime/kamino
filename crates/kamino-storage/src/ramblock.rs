@@ -281,6 +281,7 @@ fn hash_key(key: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+    use proptest::prelude::*;
 
     fn entry(key: &[u8], value: &[u8], ts: i64) -> Entry {
         Entry {
@@ -441,6 +442,102 @@ mod tests {
             .unwrap();
         rb.import(&payload).await.unwrap();
         assert_eq!(rb.get(hk).await.unwrap().unwrap().value, b"newest");
+    }
+
+    #[tokio::test]
+    async fn put_lww_rejects_older_timestamp() {
+        // Phase 5 — backup-side replication relies on LWW so out-of-order
+        // arrivals can't overwrite a fresher entry.
+        let mut rb = RamBlock::new(4096, 0.4);
+        rb.put(1, &entry(b"k", b"newer", 10)).await.unwrap();
+        let applied = rb.put_lww(1, &entry(b"k", b"older", 5)).await.unwrap();
+        assert!(!applied, "older timestamp must lose the merge");
+        assert_eq!(rb.get(1).await.unwrap().unwrap().value, b"newer");
+    }
+
+    #[tokio::test]
+    async fn put_lww_applies_newer_timestamp() {
+        let mut rb = RamBlock::new(4096, 0.4);
+        rb.put(1, &entry(b"k", b"older", 5)).await.unwrap();
+        let applied = rb.put_lww(1, &entry(b"k", b"newer", 10)).await.unwrap();
+        assert!(applied, "newer timestamp must apply");
+        assert_eq!(rb.get(1).await.unwrap().unwrap().value, b"newer");
+    }
+
+    #[tokio::test]
+    async fn put_lww_writes_when_absent() {
+        let mut rb = RamBlock::new(4096, 0.4);
+        let applied = rb.put_lww(7, &entry(b"k", b"v", 1)).await.unwrap();
+        assert!(applied, "first insert always applies");
+        assert_eq!(rb.get(7).await.unwrap().unwrap().value, b"v");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// ROADMAP §6 Phase 5 acceptance #2: under random concurrent writes
+        /// (modelled here as random arrival order), LWW must converge to a
+        /// deterministic per-key state — the entry with the highest
+        /// timestamp wins regardless of arrival order.
+        #[test]
+        fn lww_convergence_under_random_order(
+            // Up to 8 distinct keys, up to 32 (key, ts, value) writes.
+            writes in prop::collection::vec(
+                (
+                    0_u8..8,         // key id
+                    1_i64..100_000,  // timestamp
+                    any::<u8>(),     // value byte
+                ),
+                1..32,
+            ),
+        ) {
+            // Build a reference model by scanning the writes once and
+            // recording the highest-ts entry per key.
+            let mut expected: std::collections::HashMap<u8, (i64, u8)> =
+                std::collections::HashMap::new();
+            for (k, ts, v) in &writes {
+                match expected.get(k) {
+                    Some((existing_ts, _)) if *existing_ts >= *ts => {}
+                    _ => {
+                        expected.insert(*k, (*ts, *v));
+                    }
+                }
+            }
+
+            // Run the writes through `put_lww` in their given (random)
+            // order and assert the engine ends up matching the model.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("rt");
+            rt.block_on(async {
+                let mut rb = RamBlock::new(16_384, 0.4);
+                for (k, ts, v) in &writes {
+                    let key = [*k];
+                    let val = [*v];
+                    let e = entry(&key, &val, *ts);
+                    rb.put_lww(u64::from(*k), &e).await.unwrap();
+                }
+                for (k, (ts, v)) in &expected {
+                    let got = rb.get(u64::from(*k)).await.unwrap().unwrap();
+                    prop_assert_eq!(got.timestamp_nanos, *ts);
+                    prop_assert_eq!(got.value, vec![*v]);
+                }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+    }
+
+    #[tokio::test]
+    async fn put_lww_equal_timestamp_existing_wins() {
+        // Equal timestamps: existing entry wins (deterministic — primary's
+        // monotonic clock guarantees strict-monotonicity per partition, so a
+        // tie can only happen across primaries during split-brain; tie-break
+        // by "first writer keeps" matches existing import() semantics).
+        let mut rb = RamBlock::new(4096, 0.4);
+        rb.put(1, &entry(b"k", b"first", 10)).await.unwrap();
+        let applied = rb.put_lww(1, &entry(b"k", b"second", 10)).await.unwrap();
+        assert!(!applied);
+        assert_eq!(rb.get(1).await.unwrap().unwrap().value, b"first");
     }
 
     #[tokio::test]
