@@ -68,7 +68,15 @@ fn allowed_edges() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ),
         (
             "kamino-client",
-            &["kamino-core", "kamino-cluster", "kamino-protocol"],
+            // `kamino-storage` is needed by `EmbeddedClient` in Phase 1
+            // (no cluster services yet); from Phase 3 onward the embedded
+            // path should route through `kamino-cluster` instead.
+            &[
+                "kamino-core",
+                "kamino-cluster",
+                "kamino-protocol",
+                "kamino-storage",
+            ],
         ),
         (
             "kamino-server",
