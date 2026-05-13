@@ -15,11 +15,16 @@
 //! the merge so flipping the ignore-flag is the only change required at
 //! integration time.
 
-#![allow(clippy::field_reassign_with_default)]
+// Multi-node tests deliberately hold a `std::sync::MutexGuard` across `.await`
+// points to serialise themselves against each other (see `lock_multi_node`).
+// Each test runs on its own OS thread with its own current-thread tokio
+// runtime, so there's no other task that could acquire the lock, no
+// cancellation point, and no deadlock risk from the std guard.
+#![allow(clippy::field_reassign_with_default, clippy::await_holding_lock)]
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use kamino_cluster::{Cluster, ClusterDeps, StaticDiscovery, Transport as _, UdpTransport};
@@ -27,6 +32,22 @@ use kamino_core::clock::SystemClock;
 use kamino_core::config::Config;
 use kamino_core::ids::MemberId;
 use kamino_core::member::Member;
+
+/// Multi-node tests share a single process-wide *blocking* mutex so they never
+/// run concurrently. `cargo test` runs each `#[tokio::test]` on its own OS
+/// thread with a fresh tokio runtime, so a `tokio::sync::Mutex` wouldn't
+/// serialise across tests; a plain `std::sync::Mutex` works because every
+/// test thread sees the same lock. 7 turmoil tests × 5 nodes each = 35 SWIM
+/// probe loops fighting for the same scheduler caused intermittent timeouts
+/// on macOS runners under `--no-default-features`. Single-node tests stay
+/// parallel.
+fn lock_multi_node() -> MutexGuard<'static, ()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+        .lock()
+        // Poisoning is irrelevant for a counter-of-zero mutex.
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Bootstrap one node and return both the running cluster and the address
 /// it advertises for SWIM probes. `name` is purely cosmetic for logs.
@@ -134,6 +155,7 @@ async fn assemble_only_path_is_independent_of_loops() {
 
 #[tokio::test]
 async fn three_node_cluster_converges_within_three_probe_intervals() {
+    let _gate = lock_multi_node();
     let (a, addr_a) = bootstrap_node("a", 100, Vec::new()).await;
     let (b, addr_b) = bootstrap_node("b", 200, vec![addr_a]).await;
     let (c, _addr_c) = bootstrap_node("c", 300, vec![addr_a, addr_b]).await;
@@ -161,6 +183,7 @@ async fn three_node_cluster_converges_within_three_probe_intervals() {
 
 #[tokio::test]
 async fn five_node_cluster_detects_death_within_suspicion_window() {
+    let _gate = lock_multi_node();
     let mut nodes: Vec<Arc<Cluster>> = Vec::new();
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for i in 0..5_u64 {
@@ -168,16 +191,19 @@ async fn five_node_cluster_detects_death_within_suspicion_window() {
         addrs.push(addr);
         nodes.push(n);
     }
-    // Leave one node and verify the remaining four observe the shrinkage
-    // within suspicion_multiplier * probe_interval = 3 * 100ms = 300ms.
-    // The deadline is generous to absorb (1) parallel-test scheduler
-    // pressure that stretches probe_interval ticks, and (2) gossip
-    // propagation latency across the 4 surviving nodes — Phase 5's Jepsen
-    // suite verifies the tight bound under controlled conditions.
+    // Leave one node and verify the remaining four observe the shrinkage.
+    // The graceful Leave broadcast on `shutdown` should land at every
+    // survivor; if any packet drops, SWIM suspicion
+    // (suspicion_multiplier * probe_interval = 3 * 100ms = 300ms) takes over.
     let leaving = nodes.pop().unwrap();
     let _ = leaving.shutdown().await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(6000);
+    // 10s deadline is generous for two reasons: (1) it's the worst observed
+    // duration on a fully-loaded macOS GitHub runner under
+    // `--no-default-features`, and (2) the test asserts correctness — that
+    // the cluster shrinks — not tight timing; Phase 5's Jepsen suite
+    // verifies the tight bound under controlled conditions.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10_000);
     loop {
         let ok = nodes.iter().all(|n| n.snapshot_members().len() == 4);
         if ok {
@@ -200,6 +226,7 @@ async fn five_node_cluster_detects_death_within_suspicion_window() {
 
 #[tokio::test]
 async fn five_node_cluster_agrees_on_coordinator() {
+    let _gate = lock_multi_node();
     let mut nodes: Vec<Arc<Cluster>> = Vec::new();
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for i in 0..5_u64 {
@@ -234,6 +261,7 @@ async fn five_node_cluster_agrees_on_coordinator() {
 
 #[tokio::test]
 async fn simultaneous_birthdates_use_memberid_tiebreaker() {
+    let _gate = lock_multi_node();
     // All five nodes claim birthdate = 100. The deterministic tiebreaker
     // is `MemberId` (smaller wins). After convergence every node must
     // agree on the *same* coordinator.
