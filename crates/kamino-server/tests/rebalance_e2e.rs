@@ -263,6 +263,7 @@ impl ClusterEventsSink for CountingEvents {
             ClusterEvent::FragmentReceived { .. } => {
                 self.receptions.fetch_add(1, Ordering::AcqRel);
             }
+            ClusterEvent::NodeJoin { .. } | ClusterEvent::NodeLeft { .. } => {}
         }
     }
 }

@@ -190,6 +190,10 @@ pub enum ClusterEvent {
         peer: SocketAddr,
         applied: u32,
     },
+    /// A peer transitioned to `Alive` in our local membership view.
+    NodeJoin { member: String, addr: SocketAddr },
+    /// A peer left or was declared `Dead` in our local membership view.
+    NodeLeft { member: String, addr: SocketAddr },
 }
 
 /// Default `tracing`-only sink. Phase 7 replaces this with a real
@@ -227,6 +231,12 @@ impl ClusterEventsSink for TracingEventsSink {
                     applied,
                     "fragment-received accepted",
                 );
+            }
+            ClusterEvent::NodeJoin { member, addr } => {
+                info!(member = %member, addr = %addr, "node-join observed");
+            }
+            ClusterEvent::NodeLeft { member, addr } => {
+                info!(member = %member, addr = %addr, "node-left observed");
             }
         }
     }

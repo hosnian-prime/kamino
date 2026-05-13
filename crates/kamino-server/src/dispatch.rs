@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kamino_client::Client;
-use kamino_cluster::{MemberProvider, RoutingProvider};
+use kamino_cluster::{DeliveredMessage, MemberProvider, PubSubProvider, RoutingProvider};
 use kamino_protocol::{Command, Frame};
 
-use crate::handlers::{self, Response};
+use crate::handlers::{self, MultiResponse, Response};
 use crate::metrics::ServerMetrics;
 use crate::replication::TimestampSource;
 use crate::state::ConnState;
@@ -39,6 +39,10 @@ pub(crate) struct ServerContext {
     /// primary stamps its entry from here before fan-out, so backups
     /// receive a single canonical timestamp.
     pub(crate) ts_source: Arc<TimestampSource>,
+    /// Phase 7 pub/sub registry. `None` for legacy deployments without
+    /// pub/sub enabled (pre-Phase-7 servers); when missing, every
+    /// SUBSCRIBE/PUBLISH replies with `-ERR pub/sub not enabled`.
+    pub(crate) pubsub_provider: Option<Arc<dyn PubSubProvider>>,
 }
 
 impl std::fmt::Debug for ServerContext {
@@ -53,6 +57,7 @@ impl std::fmt::Debug for ServerContext {
             .field("id", &self.id)
             .field("member_provider", &self.member_provider.is_some())
             .field("routing_provider", &self.routing_provider.is_some())
+            .field("pubsub_provider", &self.pubsub_provider.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -61,15 +66,81 @@ const NOAUTH: &str = "NOAUTH Authentication required";
 const NOPERM_INTERNAL: &str = "NOPERM INTERNAL.NODE.* requires cluster_secret auth";
 const QUORUM_NOT_MET: &str = "QUORUM cluster has insufficient members";
 
-pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Command) -> Response {
+/// Result of dispatching one command. Most commands produce a single
+/// reply frame; the pub/sub `(P)?SUBSCRIBE` / `(P)?UNSUBSCRIBE` commands
+/// emit one frame per channel/pattern (matching Redis' wire shape).
+#[derive(Debug)]
+pub(crate) enum DispatchResult {
+    Single(Response),
+    Multi(MultiResponse),
+}
+
+impl DispatchResult {
+    pub(crate) const fn outcome(&self) -> crate::handlers::HandlerOutcome {
+        match self {
+            Self::Single(r) => r.outcome,
+            Self::Multi(m) => m.outcome,
+        }
+    }
+
+    /// Test convenience: unwrap as a single [`Response`]. Panics if the
+    /// dispatcher returned a multi-frame result (only pub/sub state
+    /// changers do).
+    #[cfg(test)]
+    pub(crate) fn expect_single(self) -> crate::handlers::Response {
+        match self {
+            Self::Single(r) => r,
+            Self::Multi(m) => panic!("expected single response, got multi {m:?}"),
+        }
+    }
+
+    /// Test convenience: unwrap as a multi-frame [`MultiResponse`].
+    #[cfg(test)]
+    pub(crate) fn expect_multi(self) -> MultiResponse {
+        match self {
+            Self::Multi(m) => m,
+            Self::Single(r) => panic!("expected multi response, got single {r:?}"),
+        }
+    }
+}
+
+impl From<Response> for DispatchResult {
+    fn from(r: Response) -> Self {
+        Self::Single(r)
+    }
+}
+
+impl From<MultiResponse> for DispatchResult {
+    fn from(m: MultiResponse) -> Self {
+        Self::Multi(m)
+    }
+}
+
+pub(crate) async fn dispatch(
+    ctx: &ServerContext,
+    state: &mut ConnState,
+    pubsub_sender: &tokio::sync::mpsc::Sender<DeliveredMessage>,
+    cmd: Command,
+) -> DispatchResult {
     ctx.metrics.on_command();
 
     if !state.is_authed() && !is_pre_auth_command(&cmd) {
-        return Response::ok(Frame::Error(NOAUTH.into()));
+        return Response::ok(Frame::Error(NOAUTH.into())).into();
     }
 
     if !is_internal_allowed(ctx, state, &cmd) {
-        return Response::ok(Frame::Error(NOPERM_INTERNAL.into()));
+        return Response::ok(Frame::Error(NOPERM_INTERNAL.into())).into();
+    }
+
+    // Phase 7: once a connection has entered pub/sub mode, restrict the
+    // verb set per `docs/11-pubsub.md` "Pub/Sub Mode Restrictions". Only
+    // (P)?SUBSCRIBE / (P)?UNSUBSCRIBE / PING / QUIT are accepted.
+    if state.in_pubsub_mode() && !is_pubsub_mode_allowed(&cmd) {
+        return Response::ok(Frame::Error(format!(
+            "ERR Can't execute {}: only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT allowed in this context",
+            command_verb(&cmd),
+        )))
+        .into();
     }
 
     // Phase 5: `member_count_quorum` is enforced before every DMap op.
@@ -77,7 +148,7 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
     // checked it; refusing here would break replication during a quorum
     // dip that the primary already decided to absorb.
     if !state.internode && is_dmap_op(&cmd) && !ctx_member_quorum_ok(ctx) {
-        return Response::ok(Frame::Error(QUORUM_NOT_MET.into()));
+        return Response::ok(Frame::Error(QUORUM_NOT_MET.into())).into();
     }
 
     // Internode replication arrivals never re-route — the primary already
@@ -85,11 +156,11 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
     // at the primary.
     if !state.internode {
         if let Some(moved) = check_routing(ctx, &cmd) {
-            return moved;
+            return moved.into();
         }
     }
 
-    match cmd {
+    let single: Response = match cmd {
         Command::Ping(msg) => handlers::ping(msg.as_ref()),
         Command::Auth { username, password } => handlers::auth(
             state,
@@ -214,7 +285,46 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
             )
             .await
         }
-    }
+        Command::InternalNodePublish { channel, message } => {
+            handlers::internal_node_publish(ctx.pubsub_provider.as_ref(), &channel, &message)
+        }
+        Command::Publish { channel, message } => {
+            handlers::publish(ctx.pubsub_provider.as_ref(), channel, message).await
+        }
+        Command::PubsubChannels { pattern } => {
+            handlers::pubsub_channels(ctx.pubsub_provider.as_ref(), pattern.as_ref())
+        }
+        Command::PubsubNumsub { channels } => {
+            handlers::pubsub_numsub(ctx.pubsub_provider.as_ref(), &channels)
+        }
+        Command::PubsubNumpat => handlers::pubsub_numpat(ctx.pubsub_provider.as_ref()),
+        // ---- pub/sub state-changing commands (multi-frame replies) ----
+        Command::Subscribe { channels } => {
+            return handlers::subscribe(
+                ctx.pubsub_provider.as_ref(),
+                state,
+                pubsub_sender,
+                &channels,
+            )
+            .into();
+        }
+        Command::Psubscribe { patterns } => {
+            return handlers::psubscribe(
+                ctx.pubsub_provider.as_ref(),
+                state,
+                pubsub_sender,
+                &patterns,
+            )
+            .into();
+        }
+        Command::Unsubscribe { channels } => {
+            return handlers::unsubscribe(ctx.pubsub_provider.as_ref(), state, &channels).into();
+        }
+        Command::Punsubscribe { patterns } => {
+            return handlers::punsubscribe(ctx.pubsub_provider.as_ref(), state, &patterns).into();
+        }
+    };
+    single.into()
 }
 
 /// Commands accepted before the connection has authenticated.
@@ -223,6 +333,57 @@ const fn is_pre_auth_command(cmd: &Command) -> bool {
         cmd,
         Command::Ping(_) | Command::Auth { .. } | Command::Hello(_) | Command::Quit
     )
+}
+
+/// Commands accepted while a connection is in pub/sub mode. See
+/// `docs/11-pubsub.md` "Pub/Sub Mode Restrictions".
+const fn is_pubsub_mode_allowed(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Ping(_)
+            | Command::Quit
+            | Command::Subscribe { .. }
+            | Command::Psubscribe { .. }
+            | Command::Unsubscribe { .. }
+            | Command::Punsubscribe { .. }
+    )
+}
+
+const fn command_verb(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Ping(_) => "PING",
+        Command::Auth { .. } => "AUTH",
+        Command::Hello(_) => "HELLO",
+        Command::Quit => "QUIT",
+        Command::Stats => "STATS",
+        Command::DmPut { .. } => "DM.PUT",
+        Command::DmGet { .. } => "DM.GET",
+        Command::DmDel { .. } => "DM.DEL",
+        Command::DmExpire { .. } => "DM.EXPIRE",
+        Command::DmPexpire { .. } => "DM.PEXPIRE",
+        Command::DmIncr { .. } => "DM.INCR",
+        Command::DmDecr { .. } => "DM.DECR",
+        Command::DmGetPut { .. } => "DM.GETPUT",
+        Command::DmIncrByFloat { .. } => "DM.INCRBYFLOAT",
+        Command::DmDestroy { .. } => "DM.DESTROY",
+        Command::DmScan { .. } => "DM.SCAN",
+        Command::ClusterMembers => "CLUSTER.MEMBERS",
+        Command::ClusterRoutingTable => "CLUSTER.ROUTINGTABLE",
+        Command::ClusterReady => "CLUSTER.READY",
+        Command::InternalNodeUpdateRouting { .. } => "INTERNAL.NODE.UPDATEROUTING",
+        Command::InternalNodeLengthOfPart { .. } => "INTERNAL.NODE.LENGTHOFPART",
+        Command::InternalNodeGetWithTs { .. } => "INTERNAL.NODE.GETWITHTS",
+        Command::InternalNodeMoveFragment { .. } => "INTERNAL.NODE.MOVEFRAGMENT",
+        Command::InternalNodePublish { .. } => "INTERNAL.NODE.PUBLISH",
+        Command::Subscribe { .. } => "SUBSCRIBE",
+        Command::Psubscribe { .. } => "PSUBSCRIBE",
+        Command::Unsubscribe { .. } => "UNSUBSCRIBE",
+        Command::Punsubscribe { .. } => "PUNSUBSCRIBE",
+        Command::Publish { .. } => "PUBLISH",
+        Command::PubsubChannels { .. } => "PUBSUB CHANNELS",
+        Command::PubsubNumsub { .. } => "PUBSUB NUMSUB",
+        Command::PubsubNumpat => "PUBSUB NUMPAT",
+    }
 }
 
 /// True for any DM.* mutating or read op — used to gate Phase 5
@@ -262,6 +423,7 @@ fn is_internal_allowed(ctx: &ServerContext, state: &ConnState, cmd: &Command) ->
             | Command::InternalNodeLengthOfPart { .. }
             | Command::InternalNodeGetWithTs { .. }
             | Command::InternalNodeMoveFragment { .. }
+            | Command::InternalNodePublish { .. }
     );
     if !is_internal {
         return true;
@@ -309,6 +471,18 @@ mod tests {
     use bytes::Bytes;
     use kamino_protocol::{BulkString, HelloArgs};
 
+    /// Test helper: most Phase 2-6 tests expect a single-frame `Response`.
+    /// Wrap the new `DispatchResult`-returning dispatcher so we don't have
+    /// to rewrite every assertion.
+    async fn dispatch(
+        ctx: &ServerContext,
+        state: &mut ConnState,
+        cmd: Command,
+    ) -> crate::handlers::Response {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<DeliveredMessage>(8);
+        super::dispatch(ctx, state, &tx, cmd).await.expect_single()
+    }
+
     fn ctx_no_auth() -> ServerContext {
         ServerContext {
             client: dummy_client(),
@@ -320,6 +494,7 @@ mod tests {
             member_provider: None,
             routing_provider: None,
             ts_source: Arc::new(TimestampSource::new()),
+            pubsub_provider: None,
         }
     }
 
@@ -607,6 +782,7 @@ mod tests {
             member_provider: None,
             routing_provider: Some(router),
             ts_source: Arc::new(TimestampSource::new()),
+            pubsub_provider: None,
         }
     }
 
@@ -933,6 +1109,7 @@ mod tests {
             member_provider: None,
             routing_provider: Some(router as Arc<dyn RoutingProvider>),
             ts_source: Arc::new(TimestampSource::new()),
+            pubsub_provider: None,
         }
     }
 
@@ -1100,6 +1277,127 @@ mod tests {
             panic!("expected -QUORUM");
         };
         assert!(msg.starts_with("QUORUM"), "got {msg:?}");
+    }
+
+    // ---- Phase 7 pub/sub dispatch tests --------------------------------
+
+    fn ctx_with_pubsub() -> (ServerContext, Arc<kamino_cluster::PubSubService>) {
+        let svc = Arc::new(kamino_cluster::PubSubService::new());
+        let provider: Arc<dyn PubSubProvider> =
+            Arc::new(kamino_cluster::LocalPubSubProvider::new(Arc::clone(&svc)));
+        let mut ctx = ctx_no_auth();
+        ctx.pubsub_provider = Some(provider);
+        (ctx, svc)
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_multi_ack() {
+        let (ctx, _svc) = ctx_with_pubsub();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<DeliveredMessage>(8);
+        let mut st = ConnState::new(false);
+        let resp = super::dispatch(
+            &ctx,
+            &mut st,
+            &tx,
+            Command::Subscribe {
+                channels: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            },
+        )
+        .await
+        .expect_multi();
+        assert_eq!(resp.frames.len(), 2);
+        assert!(st.in_pubsub_mode());
+    }
+
+    #[tokio::test]
+    async fn subscribed_connection_rejects_dm_commands() {
+        let (ctx, _svc) = ctx_with_pubsub();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<DeliveredMessage>(8);
+        let mut st = ConnState::new(false);
+        // Enter pub/sub mode.
+        let _ = super::dispatch(
+            &ctx,
+            &mut st,
+            &tx,
+            Command::Subscribe {
+                channels: vec![Bytes::from_static(b"events")],
+            },
+        )
+        .await;
+        // DM.GET on a subscribed connection must be rejected.
+        let resp = super::dispatch(
+            &ctx,
+            &mut st,
+            &tx,
+            Command::DmGet {
+                dmap: Bytes::from_static(b"d"),
+                key: Bytes::from_static(b"k"),
+            },
+        )
+        .await
+        .expect_single();
+        let Frame::Error(m) = resp.frame else {
+            panic!("expected error frame");
+        };
+        assert!(
+            m.contains("only (P|S)SUBSCRIBE"),
+            "expected pub/sub-mode error, got {m:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribed_connection_allows_ping() {
+        let (ctx, _svc) = ctx_with_pubsub();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<DeliveredMessage>(8);
+        let mut st = ConnState::new(false);
+        let _ = super::dispatch(
+            &ctx,
+            &mut st,
+            &tx,
+            Command::Subscribe {
+                channels: vec![Bytes::from_static(b"events")],
+            },
+        )
+        .await;
+        let resp = super::dispatch(&ctx, &mut st, &tx, Command::Ping(None))
+            .await
+            .expect_single();
+        assert!(matches!(resp.frame, Frame::SimpleString(ref s) if s == "PONG"));
+    }
+
+    #[tokio::test]
+    async fn publish_delivers_to_local_subscriber() {
+        let (ctx, _svc) = ctx_with_pubsub();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DeliveredMessage>(8);
+        let mut st = ConnState::new(false);
+        let _ = super::dispatch(
+            &ctx,
+            &mut st,
+            &tx,
+            Command::Subscribe {
+                channels: vec![Bytes::from_static(b"events")],
+            },
+        )
+        .await;
+        // Use a separate publisher state (publishers can't be in pub/sub
+        // mode by spec — but here we just exercise the registry).
+        let mut pub_state = ConnState::new(false);
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<DeliveredMessage>(8);
+        let resp = super::dispatch(
+            &ctx,
+            &mut pub_state,
+            &pub_tx,
+            Command::Publish {
+                channel: Bytes::from_static(b"events"),
+                message: Bytes::from_static(b"hello"),
+            },
+        )
+        .await
+        .expect_single();
+        assert!(matches!(resp.frame, Frame::Integer(n) if n == 1));
+        let m = rx.recv().await.unwrap();
+        assert_eq!(m.channel, "events");
+        assert_eq!(&m.payload[..], b"hello");
     }
 
     #[tokio::test]

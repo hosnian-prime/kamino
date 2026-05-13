@@ -121,6 +121,35 @@ pub enum Command {
         dmap: Bytes,
         payload: Bytes,
     },
+    /// `INTERNAL.NODE.PUBLISH <channel> <message>` — Phase 7 peer fan-out.
+    /// Receiving node delivers to local subscribers and does **not**
+    /// re-broadcast (single-hop fan-out). Reply is `:N` where `N` is the
+    /// number of local subscribers that received the message. Restricted to
+    /// peers authenticated with `cluster_secret`.
+    InternalNodePublish { channel: Bytes, message: Bytes },
+
+    // --- Pub/Sub (Phase 7) ---
+    /// `SUBSCRIBE channel [channel ...]`. Empty `channels` is rejected at
+    /// parse time per Redis arity rules.
+    Subscribe { channels: Vec<Bytes> },
+    /// `PSUBSCRIBE pattern [pattern ...]`. Glob syntax per
+    /// `docs/11-pubsub.md`: `*`, `?`, `[abc]`, `[^abc]`.
+    Psubscribe { patterns: Vec<Bytes> },
+    /// `UNSUBSCRIBE [channel ...]`. Empty list ⇒ unsubscribe from every
+    /// exact-channel subscription on this connection.
+    Unsubscribe { channels: Vec<Bytes> },
+    /// `PUNSUBSCRIBE [pattern ...]`. Empty list ⇒ unsubscribe from every
+    /// pattern on this connection.
+    Punsubscribe { patterns: Vec<Bytes> },
+    /// `PUBLISH channel message`. Fans out cluster-wide; the reply is the
+    /// total subscriber count reached across all live nodes.
+    Publish { channel: Bytes, message: Bytes },
+    /// `PUBSUB CHANNELS [pattern]` — list active exact channels.
+    PubsubChannels { pattern: Option<Bytes> },
+    /// `PUBSUB NUMSUB [channel ...]` — per-channel subscriber count.
+    PubsubNumsub { channels: Vec<Bytes> },
+    /// `PUBSUB NUMPAT` — number of distinct patterns subscribed cluster-wide.
+    PubsubNumpat,
 }
 
 /// Fragment-migration ownership semantics.
@@ -251,6 +280,13 @@ impl Command {
             b"INTERNAL.NODE.LENGTHOFPART" => parse_internal_length_of_part(args),
             b"INTERNAL.NODE.GETWITHTS" => parse_internal_get_with_ts(args),
             b"INTERNAL.NODE.MOVEFRAGMENT" => parse_internal_move_fragment(args),
+            b"INTERNAL.NODE.PUBLISH" => parse_internal_publish(args),
+            b"SUBSCRIBE" => parse_subscribe(args),
+            b"PSUBSCRIBE" => parse_psubscribe(args),
+            b"UNSUBSCRIBE" => Ok(parse_unsubscribe(args)),
+            b"PUNSUBSCRIBE" => Ok(parse_punsubscribe(args)),
+            b"PUBLISH" => parse_publish(args),
+            b"PUBSUB" => parse_pubsub(args),
             _ => Err(CommandError::UnknownCommand(
                 String::from_utf8_lossy(verb_lower).into_owned(),
             )),
@@ -394,6 +430,65 @@ impl Command {
                 bulk_bytes(dmap),
                 Frame::Bulk(BulkString::from_bytes(payload.clone())),
             ],
+            Self::InternalNodePublish { channel, message } => vec![
+                bulk("INTERNAL.NODE.PUBLISH"),
+                bulk_bytes(channel),
+                Frame::Bulk(BulkString::from_bytes(message.clone())),
+            ],
+            Self::Subscribe { channels } => {
+                let mut v = Vec::with_capacity(1 + channels.len());
+                v.push(bulk("SUBSCRIBE"));
+                for c in channels {
+                    v.push(bulk_bytes(c));
+                }
+                v
+            }
+            Self::Psubscribe { patterns } => {
+                let mut v = Vec::with_capacity(1 + patterns.len());
+                v.push(bulk("PSUBSCRIBE"));
+                for p in patterns {
+                    v.push(bulk_bytes(p));
+                }
+                v
+            }
+            Self::Unsubscribe { channels } => {
+                let mut v = Vec::with_capacity(1 + channels.len());
+                v.push(bulk("UNSUBSCRIBE"));
+                for c in channels {
+                    v.push(bulk_bytes(c));
+                }
+                v
+            }
+            Self::Punsubscribe { patterns } => {
+                let mut v = Vec::with_capacity(1 + patterns.len());
+                v.push(bulk("PUNSUBSCRIBE"));
+                for p in patterns {
+                    v.push(bulk_bytes(p));
+                }
+                v
+            }
+            Self::Publish { channel, message } => vec![
+                bulk("PUBLISH"),
+                bulk_bytes(channel),
+                Frame::Bulk(BulkString::from_bytes(message.clone())),
+            ],
+            Self::PubsubChannels { pattern } => {
+                let mut v = vec![bulk("PUBSUB"), bulk("CHANNELS")];
+                if let Some(p) = pattern {
+                    v.push(bulk_bytes(p));
+                }
+                v
+            }
+            Self::PubsubNumsub { channels } => {
+                let mut v = Vec::with_capacity(2 + channels.len());
+                v.push(bulk("PUBSUB"));
+                v.push(bulk("NUMSUB"));
+                for c in channels {
+                    v.push(bulk_bytes(c));
+                }
+                v
+            }
+            Self::PubsubNumpat => vec![bulk("PUBSUB"), bulk("NUMPAT")],
         };
         Frame::Array(Some(parts))
     }
@@ -972,6 +1067,97 @@ fn parse_dm_scan(args: Vec<Bytes>) -> Result<Command, CommandError> {
     })
 }
 
+fn parse_internal_publish(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_exact(&args, "INTERNAL.NODE.PUBLISH", 2)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    Ok(Command::InternalNodePublish {
+        channel: iter.next().unwrap(),
+        message: iter.next().unwrap(),
+    })
+}
+
+fn parse_subscribe(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_at_least(&args, "SUBSCRIBE", 1)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    Ok(Command::Subscribe {
+        channels: iter.collect(),
+    })
+}
+
+fn parse_psubscribe(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_at_least(&args, "PSUBSCRIBE", 1)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    Ok(Command::Psubscribe {
+        patterns: iter.collect(),
+    })
+}
+
+fn parse_unsubscribe(args: Vec<Bytes>) -> Command {
+    // Zero args is legal: "unsubscribe from all".
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    Command::Unsubscribe {
+        channels: iter.collect(),
+    }
+}
+
+fn parse_punsubscribe(args: Vec<Bytes>) -> Command {
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    Command::Punsubscribe {
+        patterns: iter.collect(),
+    }
+}
+
+fn parse_publish(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_exact(&args, "PUBLISH", 2)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    Ok(Command::Publish {
+        channel: iter.next().unwrap(),
+        message: iter.next().unwrap(),
+    })
+}
+
+fn parse_pubsub(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_at_least(&args, "PUBSUB", 1)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    let sub = iter.next().unwrap();
+    if eq_ascii_ci(&sub, b"CHANNELS") {
+        let pattern = iter.next();
+        if iter.next().is_some() {
+            return Err(CommandError::WrongArity {
+                command: "PUBSUB CHANNELS",
+                expected: ArityHint::Range { min: 0, max: 1 },
+                got: 2, // saturates fine; signal "more than one"
+            });
+        }
+        Ok(Command::PubsubChannels { pattern })
+    } else if eq_ascii_ci(&sub, b"NUMSUB") {
+        Ok(Command::PubsubNumsub {
+            channels: iter.collect(),
+        })
+    } else if eq_ascii_ci(&sub, b"NUMPAT") {
+        if iter.next().is_some() {
+            return Err(CommandError::WrongArity {
+                command: "PUBSUB NUMPAT",
+                expected: ArityHint::Exactly(0),
+                got: 1,
+            });
+        }
+        Ok(Command::PubsubNumpat)
+    } else {
+        Err(CommandError::InvalidArgument {
+            command: "PUBSUB",
+            reason: format!("unknown subcommand {:?}", String::from_utf8_lossy(&sub)),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1519,6 +1705,149 @@ mod tests {
     }
 
     #[test]
+    fn parse_subscribe_single() {
+        let frame = arr(&[b"SUBSCRIBE", b"events"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::Subscribe {
+                channels: vec![b("events")],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscribe_multi() {
+        let frame = arr(&[b"SUBSCRIBE", b"a", b"b", b"c"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::Subscribe {
+                channels: vec![b("a"), b("b"), b("c")],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscribe_rejects_empty() {
+        let frame = arr(&[b"SUBSCRIBE"]);
+        assert_matches!(
+            Command::parse(frame),
+            Err(CommandError::WrongArity {
+                command: "SUBSCRIBE",
+                ..
+            })
+        );
+    }
+
+    #[test]
+    fn parse_psubscribe_multi() {
+        let frame = arr(&[b"PSUBSCRIBE", b"events.*", b"user.?"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::Psubscribe {
+                patterns: vec![b("events.*"), b("user.?")],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_unsubscribe_no_args_is_legal() {
+        let frame = arr(&[b"UNSUBSCRIBE"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::Unsubscribe { channels: vec![] }
+        );
+    }
+
+    #[test]
+    fn parse_punsubscribe_no_args_is_legal() {
+        let frame = arr(&[b"PUNSUBSCRIBE"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::Punsubscribe { patterns: vec![] }
+        );
+    }
+
+    #[test]
+    fn parse_publish() {
+        let frame = arr(&[b"PUBLISH", b"ch", b"msg"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::Publish {
+                channel: b("ch"),
+                message: b("msg"),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_publish_wrong_arity() {
+        let frame = arr(&[b"PUBLISH", b"only"]);
+        assert_matches!(
+            Command::parse(frame),
+            Err(CommandError::WrongArity {
+                command: "PUBLISH",
+                ..
+            })
+        );
+    }
+
+    #[test]
+    fn parse_pubsub_channels_no_pattern() {
+        let frame = arr(&[b"PUBSUB", b"CHANNELS"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::PubsubChannels { pattern: None }
+        );
+    }
+
+    #[test]
+    fn parse_pubsub_channels_with_pattern() {
+        let frame = arr(&[b"PUBSUB", b"CHANNELS", b"events.*"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::PubsubChannels {
+                pattern: Some(b("events.*"))
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pubsub_numsub_empty_is_legal() {
+        let frame = arr(&[b"PUBSUB", b"NUMSUB"]);
+        assert_eq!(
+            Command::parse(frame).unwrap(),
+            Command::PubsubNumsub { channels: vec![] }
+        );
+    }
+
+    #[test]
+    fn parse_pubsub_numpat() {
+        let frame = arr(&[b"PUBSUB", b"NUMPAT"]);
+        assert_eq!(Command::parse(frame).unwrap(), Command::PubsubNumpat);
+    }
+
+    #[test]
+    fn parse_pubsub_unknown_subcommand() {
+        let frame = arr(&[b"PUBSUB", b"BOGUS"]);
+        assert_matches!(
+            Command::parse(frame),
+            Err(CommandError::InvalidArgument {
+                command: "PUBSUB",
+                ..
+            })
+        );
+    }
+
+    #[test]
+    fn parse_internal_publish_roundtrip() {
+        let cmd = Command::InternalNodePublish {
+            channel: b("ch"),
+            message: b("payload"),
+        };
+        assert_eq!(Command::parse(cmd.to_frame()).unwrap(), cmd);
+    }
+
+    #[test]
     fn parse_internal_move_fragment_accepts_backup_type() {
         let frame = arr(&[b"INTERNAL.NODE.MOVEFRAGMENT", b"7", b"1", b"dm", b"payload"]);
         let Command::InternalNodeMoveFragment { partition_type, .. } =
@@ -1780,6 +2109,23 @@ mod tests {
                         payload,
                     }
                 }),
+            (bytes_strategy(), bytes_strategy())
+                .prop_map(|(channel, message)| Command::InternalNodePublish { channel, message }),
+            prop::collection::vec(bytes_strategy(), 1..=4)
+                .prop_map(|channels| Command::Subscribe { channels }),
+            prop::collection::vec(bytes_strategy(), 1..=4)
+                .prop_map(|patterns| Command::Psubscribe { patterns }),
+            prop::collection::vec(bytes_strategy(), 0..=4)
+                .prop_map(|channels| Command::Unsubscribe { channels }),
+            prop::collection::vec(bytes_strategy(), 0..=4)
+                .prop_map(|patterns| Command::Punsubscribe { patterns }),
+            (bytes_strategy(), bytes_strategy())
+                .prop_map(|(channel, message)| Command::Publish { channel, message }),
+            prop::option::of(bytes_strategy())
+                .prop_map(|pattern| Command::PubsubChannels { pattern }),
+            prop::collection::vec(bytes_strategy(), 0..=4)
+                .prop_map(|channels| Command::PubsubNumsub { channels }),
+            Just(Command::PubsubNumpat),
         ]
     }
 

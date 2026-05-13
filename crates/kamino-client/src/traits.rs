@@ -11,6 +11,7 @@ use async_trait::async_trait;
 
 use crate::dmap::DMap;
 use crate::error::{Error, Result};
+use crate::pubsub::PubSub;
 use crate::stats::{Stats, StatsOptions};
 use crate::types::DMapOptions;
 
@@ -97,5 +98,14 @@ pub trait Client: Send + Sync + std::fmt::Debug {
     /// storage to compact).
     async fn cleanup_empty_fragments(&self) -> Result<usize> {
         Ok(0)
+    }
+
+    // ---- Phase 7 pub/sub ------------------------------------------------------------------
+    /// Build a pub/sub handle. The default returns an `Unsupported` error;
+    /// in-process `EmbeddedClient` overrides this so app code can
+    /// `subscribe` / `publish` against a local registry without going
+    /// through the RESP wire.
+    fn new_pubsub(&self) -> Result<Arc<dyn PubSub>> {
+        Err(Error::Unsupported("new_pubsub"))
     }
 }

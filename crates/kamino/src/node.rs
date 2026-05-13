@@ -149,7 +149,11 @@ impl Kamino {
         let workers = spawn_workers(&client, &cancel, &clock, &config);
 
         let erased: Arc<dyn Client> = Arc::clone(&client) as Arc<dyn Client>;
-        let server = Server::bind(&config, erased).await?;
+        // Share the embedded client's pub/sub service with the RESP
+        // server so subscribers reached over the wire and in-process
+        // subscribers see the same registry.
+        let server =
+            Server::bind_with_pubsub_service(&config, erased, client.pubsub_service()).await?;
         Ok(Self {
             client,
             cancel,

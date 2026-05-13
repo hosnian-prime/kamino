@@ -645,6 +645,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "kamino-cluster",
  "kamino-core",
  "kamino-protocol",
  "kamino-storage",

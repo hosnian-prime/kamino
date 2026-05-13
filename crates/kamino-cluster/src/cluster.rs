@@ -28,8 +28,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::balancer::{
-    BalancerParams, ClusterEventsSink, ForwarderTransport, MigrationSource, MigrationTransport,
-    OrphanSink, TracingEventsSink, run_balancer_loop,
+    BalancerParams, ClusterEvent, ClusterEventsSink, ForwarderTransport, MigrationSource,
+    MigrationTransport, OrphanSink, TracingEventsSink, run_balancer_loop,
 };
 use crate::discovery::DiscoveryPlugin;
 use crate::error::{ClusterError, ClusterResult};
@@ -37,6 +37,7 @@ use crate::forwarder::{Forwarder, ForwarderConfig};
 use crate::gossip::GossipQueue;
 use crate::join::{self, JoinParams};
 use crate::membership::MembershipView;
+use crate::pubsub::{DeliveredMessage, PubSubProvider, PubSubService, SubAck};
 use crate::routing::coordinator::{
     CoordinatorParams, LocalOnlyPusher, RoutingPusher, SignatureClock, run_coordinator_loop,
 };
@@ -95,6 +96,15 @@ pub struct Cluster {
     /// on every tick. `local_orphans()` returns a clone of this so the
     /// handler stays synchronous.
     orphan_cache: Mutex<Vec<(u32, String)>>,
+    /// Phase 7 pub/sub registry. Wrapping the service in an `Arc` here
+    /// lets `Cluster` implement `PubSubProvider` directly while the
+    /// server-side connection handlers share the same `Arc` for direct
+    /// access to `register_conn` / `cleanup_conn` outside the dispatcher.
+    pubsub: Arc<PubSubService>,
+    /// Whether `cluster.events` publication is enabled. Mirrors
+    /// `[events] enable_cluster_events_channel` per
+    /// `docs/09-configuration.md`.
+    events_channel_enabled: bool,
 }
 
 impl Cluster {
@@ -146,6 +156,8 @@ impl Cluster {
             member_count_quorum: deps.config.core.member_count_quorum,
             balancer_trigger_interval: deps.config.balancer.trigger_interval,
             orphan_cache: Mutex::new(Vec::new()),
+            pubsub: Arc::new(PubSubService::new()),
+            events_channel_enabled: deps.config.events.enable_cluster_events_channel,
         }
     }
 
@@ -162,6 +174,31 @@ impl Cluster {
     #[must_use]
     pub fn forwarder(&self) -> Option<Forwarder> {
         self.forwarder.clone()
+    }
+
+    /// Shared pub/sub registry. The server-side connection handlers use
+    /// this directly to register their per-conn `mpsc::Sender` and
+    /// clean up on disconnect.
+    #[must_use]
+    pub fn pubsub(&self) -> Arc<PubSubService> {
+        Arc::clone(&self.pubsub)
+    }
+
+    /// Whether `cluster.events` publication is enabled.
+    #[must_use]
+    pub const fn events_channel_enabled(&self) -> bool {
+        self.events_channel_enabled
+    }
+
+    /// Live peer addresses (excluding the local node) — used by the pub/sub
+    /// cluster fan-out and the [`ClusterEventsSink`] adapter.
+    fn live_peer_addrs(&self) -> Vec<SocketAddr> {
+        self.view
+            .snapshot()
+            .into_iter()
+            .filter(|m| m.id != self.local_id)
+            .map(|m| m.addr)
+            .collect()
     }
 
     /// `[network]` knobs for downstream wiring (e.g. server-side MOVED
@@ -360,6 +397,76 @@ impl Cluster {
         });
         self.tasks.lock().push(handle);
         debug!("balancer loop spawned");
+    }
+
+    /// Spawn the Phase 7 membership-event loop. Polls the local
+    /// membership view at `interval` and publishes `node-join` /
+    /// `node-left` events into `events` whenever a peer's `Alive` set
+    /// changes. Delivery is best-effort (the same at-most-once contract
+    /// the rest of pub/sub uses).
+    ///
+    /// Returns silently if the supplied sink wouldn't publish anything
+    /// useful — e.g. caller passed [`TracingEventsSink`] without
+    /// enabling `cluster.events`. Tests that need deterministic event
+    /// observation construct the loop manually.
+    pub fn spawn_membership_events(
+        self: &Arc<Self>,
+        events: Arc<dyn ClusterEventsSink>,
+        interval: std::time::Duration,
+    ) {
+        let view = self.view.clone();
+        let local_id = self.local_id;
+        let cancel = self.cancel.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate first tick
+            let mut last: std::collections::BTreeMap<
+                kamino_core::ids::MemberId,
+                std::net::SocketAddr,
+            > = view
+                .snapshot()
+                .into_iter()
+                .filter(|m| m.id != local_id)
+                .map(|m| (m.id, m.addr))
+                .collect();
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    _ = ticker.tick() => {}
+                }
+                let now: std::collections::BTreeMap<
+                    kamino_core::ids::MemberId,
+                    std::net::SocketAddr,
+                > = view
+                    .snapshot()
+                    .into_iter()
+                    .filter(|m| m.id != local_id)
+                    .map(|m| (m.id, m.addr))
+                    .collect();
+                // Find new members (in `now` but not in `last`).
+                for (id, addr) in &now {
+                    if !last.contains_key(id) {
+                        events.publish(ClusterEvent::NodeJoin {
+                            member: format!("{id:?}"),
+                            addr: *addr,
+                        });
+                    }
+                }
+                // Find departed members (in `last` but not in `now`).
+                for (id, addr) in &last {
+                    if !now.contains_key(id) {
+                        events.publish(ClusterEvent::NodeLeft {
+                            member: format!("{id:?}"),
+                            addr: *addr,
+                        });
+                    }
+                }
+                last = now;
+            }
+        });
+        self.tasks.lock().push(handle);
+        debug!(?interval, "membership-event loop spawned");
     }
 
     /// Spawn the Phase 6 empty-fragment cleanup loop. Wakes up every
@@ -906,6 +1013,170 @@ impl RoutingProvider for Cluster {
             }
         })
     }
+}
+
+impl PubSubProvider for Cluster {
+    fn allocate_conn_id(&self) -> u64 {
+        self.pubsub.next_conn_id()
+    }
+    fn register_conn(&self, conn_id: u64, sender: tokio::sync::mpsc::Sender<DeliveredMessage>) {
+        self.pubsub.register_conn(conn_id, sender);
+    }
+    fn cleanup_conn(&self, conn_id: u64) {
+        self.pubsub.cleanup_conn(conn_id);
+    }
+    fn subscribe(&self, conn_id: u64, channels: &[bytes::Bytes]) -> Vec<SubAck> {
+        self.pubsub.subscribe(conn_id, channels)
+    }
+    fn psubscribe(&self, conn_id: u64, patterns: &[bytes::Bytes]) -> Vec<SubAck> {
+        self.pubsub.psubscribe(conn_id, patterns)
+    }
+    fn unsubscribe(&self, conn_id: u64, channels: Option<&[bytes::Bytes]>) -> Vec<SubAck> {
+        self.pubsub.unsubscribe(conn_id, channels)
+    }
+    fn punsubscribe(&self, conn_id: u64, patterns: Option<&[bytes::Bytes]>) -> Vec<SubAck> {
+        self.pubsub.punsubscribe(conn_id, patterns)
+    }
+    fn publish<'a>(
+        &'a self,
+        channel: bytes::Bytes,
+        message: bytes::Bytes,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send + 'a>> {
+        Box::pin(async move {
+            let channel_name = String::from_utf8_lossy(&channel).into_owned();
+            let mut total = self.pubsub.publish_local(&channel_name, &message);
+            let Some(fwd) = self.forwarder.clone() else {
+                return total;
+            };
+            let peers = self.live_peer_addrs();
+            if peers.is_empty() {
+                return total;
+            }
+            let cmd = kamino_protocol::Command::InternalNodePublish {
+                channel: channel.clone(),
+                message: message.clone(),
+            };
+            let mut futures = Vec::with_capacity(peers.len());
+            for peer in peers {
+                let cmd_clone = cmd.clone();
+                let fwd = fwd.clone();
+                futures.push(async move { fwd.send(peer, cmd_clone).await });
+            }
+            let replies = futures::future::join_all(futures).await;
+            for r in replies {
+                match r {
+                    Ok(kamino_protocol::Frame::Integer(n)) if n >= 0 => {
+                        total = total.saturating_add(usize::try_from(n).unwrap_or(usize::MAX));
+                    }
+                    Ok(other) => {
+                        tracing::warn!(reply = ?other, "INTERNAL.NODE.PUBLISH unexpected reply");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "INTERNAL.NODE.PUBLISH transport error");
+                    }
+                }
+            }
+            total
+        })
+    }
+    fn publish_local(&self, channel: &str, message: &bytes::Bytes) -> usize {
+        self.pubsub.publish_local(channel, message)
+    }
+    fn pubsub_channels(&self, pattern: Option<&str>) -> Vec<String> {
+        self.pubsub.pubsub_channels(pattern)
+    }
+    fn pubsub_numsub(&self, channels: &[bytes::Bytes]) -> Vec<(bytes::Bytes, usize)> {
+        self.pubsub.pubsub_numsub(channels)
+    }
+    fn pubsub_numpat(&self) -> usize {
+        self.pubsub.pubsub_numpat()
+    }
+}
+
+/// `ClusterEvent` sink that publishes JSON-encoded events into the
+/// `cluster.events` pub/sub channel. The cluster runtime selects this
+/// when `[events] enable_cluster_events_channel = true`; otherwise the
+/// [`TracingEventsSink`] is used.
+///
+/// Delivery is best-effort: the channel is over pub/sub, which is
+/// documented at-most-once. Consumers that need ground truth should
+/// poll `CLUSTER.MEMBERS` / `CLUSTER.ROUTINGTABLE` periodically.
+///
+/// [`TracingEventsSink`]: crate::balancer::TracingEventsSink
+#[derive(Debug)]
+pub struct PubSubEventsSink {
+    service: Arc<PubSubService>,
+}
+
+impl PubSubEventsSink {
+    /// Build a sink that writes into the supplied [`PubSubService`].
+    #[must_use]
+    pub const fn new(service: Arc<PubSubService>) -> Self {
+        Self { service }
+    }
+}
+
+const CLUSTER_EVENTS_CHANNEL: &str = "cluster.events";
+
+impl ClusterEventsSink for PubSubEventsSink {
+    fn publish(&self, event: ClusterEvent) {
+        let payload = match &event {
+            ClusterEvent::FragmentMigration {
+                dmap,
+                partition_id,
+                peer,
+                entries,
+            } => format!(
+                "{{\"type\":\"fragment-migration\",\"dmap\":\"{}\",\"partition\":{},\"peer\":\"{}\",\"entries\":{}}}",
+                escape_json(dmap),
+                partition_id,
+                peer,
+                entries,
+            ),
+            ClusterEvent::FragmentReceived {
+                dmap,
+                partition_id,
+                peer,
+                applied,
+            } => format!(
+                "{{\"type\":\"fragment-received\",\"dmap\":\"{}\",\"partition\":{},\"peer\":\"{}\",\"applied\":{}}}",
+                escape_json(dmap),
+                partition_id,
+                peer,
+                applied,
+            ),
+            ClusterEvent::NodeJoin { member, addr } => format!(
+                "{{\"type\":\"node-join\",\"member\":\"{}\",\"addr\":\"{}\"}}",
+                escape_json(member),
+                addr,
+            ),
+            ClusterEvent::NodeLeft { member, addr } => format!(
+                "{{\"type\":\"node-left\",\"member\":\"{}\",\"addr\":\"{}\"}}",
+                escape_json(member),
+                addr,
+            ),
+        };
+        let body = bytes::Bytes::from(payload);
+        self.service.publish_local(CLUSTER_EVENTS_CHANNEL, &body);
+    }
+}
+
+/// Minimal JSON string escaper: enough for member ids, dmap names, and
+/// IPv4/IPv6 socket addresses (which never contain control chars).
+fn escape_json(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    for c in input.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn forwarder_config_from(cfg: &kamino_core::config::Config) -> ForwarderConfig {
