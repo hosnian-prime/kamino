@@ -21,14 +21,17 @@ use kamino_core::clock::Clock;
 use kamino_core::config::Config;
 use kamino_core::ids::MemberId;
 use kamino_core::member::Member;
+use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 use crate::discovery::DiscoveryPlugin;
 use crate::error::ClusterResult;
 use crate::gossip::GossipQueue;
+use crate::join::{self, JoinParams};
 use crate::membership::MembershipView;
-use crate::swim::SwimDriver;
+use crate::swim::{SwimDriver, run_probe_loop, run_receive_loop};
 use crate::transport::Transport;
 
 /// External dependencies the cluster runtime needs.
@@ -51,10 +54,14 @@ pub struct Cluster {
     queue: Arc<GossipQueue>,
     transport: Arc<dyn Transport>,
     discovery: Arc<dyn DiscoveryPlugin>,
+    clock: Arc<dyn Clock>,
     cancel: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
     local_id: MemberId,
+    local_member: Member,
     cluster_secret: String,
+    swim_config: kamino_core::config::SwimConfig,
+    discovery_config: kamino_core::config::DiscoveryConfig,
     leave_timeout: std::time::Duration,
 }
 
@@ -75,12 +82,79 @@ impl Cluster {
             queue,
             transport: deps.transport,
             discovery: deps.discovery,
+            clock: deps.clock,
             cancel: CancellationToken::new(),
-            tasks: Vec::new(),
+            tasks: Mutex::new(Vec::new()),
             local_id: deps.local.id,
+            local_member: deps.local.clone(),
             cluster_secret: deps.config.auth.cluster_secret.clone(),
+            swim_config: deps.config.swim.clone(),
+            discovery_config: deps.config.discovery.clone(),
             leave_timeout: deps.config.discovery.leave_timeout,
         })
+    }
+
+    /// Assemble the cluster, run `join()` (best-effort, capped by
+    /// `bootstrap_timeout`), then spawn the SWIM receive and probe loops.
+    ///
+    /// Returned as an `Arc<Self>` so callers can register the same instance
+    /// as a `MemberProvider` with the RESP server.
+    ///
+    /// `join` errors are downgraded to a `warn!` so that nodes brought up
+    /// before their peers don't fail to start. Single-node deployments (no
+    /// peers configured **and** discovery returns nothing) succeed silently.
+    pub async fn bootstrap(deps: ClusterDeps) -> ClusterResult<Arc<Self>> {
+        // Run init on the discovery plugin once (idempotent for the static
+        // and DNS plugins; matters for K8s/Consul in later phases).
+        deps.discovery.init().await?;
+
+        let swim_config = deps.config.swim.clone();
+        let discovery_config = deps.config.discovery.clone();
+        let bootstrap_timeout = discovery_config.bootstrap_timeout;
+        let clock = Arc::clone(&deps.clock);
+
+        let cluster = Arc::new(Self::assemble(deps)?);
+
+        // Best-effort join. Respect bootstrap_timeout as a hard ceiling so a
+        // misconfigured peer list cannot block start-up forever.
+        let join_params = JoinParams {
+            discovery: discovery_config,
+            probe_timeout: swim_config.probe_timeout,
+        };
+        let join_future = join::join(&cluster, join_params);
+        match tokio::time::timeout(bootstrap_timeout, join_future).await {
+            Ok(Ok(n)) => {
+                info!(peers = n, "cluster join handshake complete");
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "cluster join failed; continuing in single-node mode");
+            }
+            Err(_) => {
+                warn!(
+                    timeout = ?bootstrap_timeout,
+                    "cluster join timed out; continuing in single-node mode",
+                );
+            }
+        }
+
+        // Spawn SWIM loops. Both loops co-operate via the shared cancel
+        // token; shutdown() cancels and awaits them in order.
+        let driver = Arc::new(cluster.driver(clock, swim_config));
+        let recv_driver = Arc::clone(&driver);
+        let probe_driver = Arc::clone(&driver);
+        let recv_handle = tokio::spawn(async move {
+            run_receive_loop(recv_driver).await;
+        });
+        let probe_handle = tokio::spawn(async move {
+            run_probe_loop(probe_driver).await;
+        });
+        {
+            let mut tasks = cluster.tasks.lock();
+            tasks.push(recv_handle);
+            tasks.push(probe_handle);
+        }
+        debug!("cluster SWIM loops spawned");
+        Ok(cluster)
     }
 
     /// Local membership view (cheap clone).
@@ -91,7 +165,11 @@ impl Cluster {
 
     /// Build a SwimDriver for the assembled cluster. Caller decides whether
     /// to run the probe + receive loops or test them in isolation.
-    pub fn driver(&self, clock: Arc<dyn Clock>, config: kamino_core::config::SwimConfig) -> SwimDriver {
+    pub fn driver(
+        &self,
+        clock: Arc<dyn Clock>,
+        config: kamino_core::config::SwimConfig,
+    ) -> SwimDriver {
         SwimDriver::new(
             config,
             self.view.clone(),
@@ -111,7 +189,7 @@ impl Cluster {
 
     /// Local node id.
     #[must_use]
-    pub fn local_id(&self) -> MemberId {
+    pub const fn local_id(&self) -> MemberId {
         self.local_id
     }
 
@@ -122,8 +200,8 @@ impl Cluster {
     }
 
     /// Register a spawned background task so `shutdown` can await it.
-    pub fn register_task(&mut self, task: JoinHandle<()>) {
-        self.tasks.push(task);
+    pub fn register_task(&self, task: JoinHandle<()>) {
+        self.tasks.lock().push(task);
     }
 
     /// Cancellation token shared across all SWIM tasks.
@@ -132,9 +210,58 @@ impl Cluster {
         self.cancel.clone()
     }
 
+    /// Gossip queue (used by the join handshake).
+    #[must_use]
+    pub fn gossip_queue(&self) -> Arc<GossipQueue> {
+        Arc::clone(&self.queue)
+    }
+
+    /// Underlying transport (used by the join handshake to send pings to
+    /// bootstrap peers before any background loops exist).
+    #[must_use]
+    pub fn transport(&self) -> Arc<dyn Transport> {
+        Arc::clone(&self.transport)
+    }
+
+    /// Discovery plugin handle.
+    #[must_use]
+    pub fn discovery(&self) -> Arc<dyn DiscoveryPlugin> {
+        Arc::clone(&self.discovery)
+    }
+
+    /// Local member descriptor (full `Member`, not just the id).
+    #[must_use]
+    pub fn local_member(&self) -> Member {
+        self.local_member.clone()
+    }
+
+    /// Configured `cluster_secret` for outgoing envelopes.
+    #[must_use]
+    pub fn cluster_secret(&self) -> &str {
+        &self.cluster_secret
+    }
+
+    /// SWIM tuning (for tests).
+    #[must_use]
+    pub const fn swim_config(&self) -> &kamino_core::config::SwimConfig {
+        &self.swim_config
+    }
+
+    /// Discovery tuning (for tests).
+    #[must_use]
+    pub const fn discovery_config(&self) -> &kamino_core::config::DiscoveryConfig {
+        &self.discovery_config
+    }
+
+    /// Clock shared with the SWIM driver.
+    #[must_use]
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
     /// Gracefully leave the cluster: broadcast a Leave gossip event,
     /// wait `leave_timeout`, then cancel and join all tasks.
-    pub async fn shutdown(mut self) -> ClusterResult<()> {
+    pub async fn shutdown(self: Arc<Self>) -> ClusterResult<()> {
         let incarnation = self.view.local_incarnation();
         let leave_event = crate::message::GossipEvent::Leave {
             id: self.local_id,
@@ -168,7 +295,8 @@ impl Cluster {
         .await;
 
         self.cancel.cancel();
-        for task in std::mem::take(&mut self.tasks) {
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.tasks.lock());
+        for task in handles {
             let _ = task.await;
         }
         let _ = self.discovery.shutdown().await;
