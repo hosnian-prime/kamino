@@ -22,6 +22,7 @@ roaring = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
 regex = "1.10"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
