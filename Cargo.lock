@@ -649,6 +649,7 @@ dependencies = [
  "kamino-protocol",
  "kamino-storage",
  "parking_lot",
+ "proptest",
  "rand 0.8.6",
  "regex",
  "thiserror",

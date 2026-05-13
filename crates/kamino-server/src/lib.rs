@@ -121,7 +121,14 @@ impl Server {
             return Err(ServerError::WrongMode(config.mode.as_str()));
         }
         let member_provider: Arc<dyn MemberProvider> = Arc::clone(&cluster) as _;
-        let routing_provider: Arc<dyn RoutingProvider> = cluster;
+        let routing_provider: Arc<dyn RoutingProvider> = Arc::clone(&cluster) as _;
+        // Phase 6: hand the cluster a `MigrationSource` so its balancer loop
+        // can drive `INTERNAL.NODE.MOVEFRAGMENT` against this server's
+        // storage. The cluster owns the JoinHandle and the cancel token.
+        let source: Arc<dyn kamino_cluster::MigrationSource> = Arc::new(
+            crate::replication::ClientMigrationSource::new(Arc::clone(&client)),
+        );
+        cluster.spawn_balancer(source, None);
         Self::bind_internal(
             config,
             client,

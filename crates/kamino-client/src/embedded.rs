@@ -21,6 +21,7 @@ use crate::cursor::{BufferedCursor, ScanCursor, ScanOptions, glob_to_regex};
 use crate::dmap::DMap;
 use crate::error::{Error, Result};
 use crate::lock::LockContext;
+use crate::migration::{decode_fragment_payload, encode_fragment_payload};
 use crate::stats::{DMapStats, Stats, StatsOptions};
 use crate::traits::Client;
 use crate::types::{DMapOptions, GetResponse, PutOptions, micros_to_nanos_i64};
@@ -86,6 +87,17 @@ impl EmbeddedClient {
     pub fn registered_dmaps(&self) -> Vec<Arc<EmbeddedDMap>> {
         self.dmaps.read().values().cloned().collect()
     }
+
+    /// Compute the routing-level partition id for `(dmap, key)`. Mirrors
+    /// `kamino_cluster::partition_for` so the migration path uses exactly
+    /// the same partition function as the routing table.
+    fn partition_for(&self, dmap: &[u8], key: &[u8]) -> u32 {
+        let mut buf = Vec::with_capacity(dmap.len() + key.len());
+        buf.extend_from_slice(dmap);
+        buf.extend_from_slice(key);
+        let h = self.deps.hasher.hash64(&buf);
+        u32::try_from(h % u64::from(self.deps.partition_count)).expect("modulo of u32 fits in u32")
+    }
 }
 
 #[async_trait]
@@ -117,6 +129,100 @@ impl Client for EmbeddedClient {
         // its references the fragments will be reclaimed.
         self.dmaps.write().clear();
         Ok(())
+    }
+
+    async fn local_partitions(&self) -> Result<Vec<(String, u32)>> {
+        let mut out: Vec<(String, u32)> = Vec::new();
+        for dmap in self.registered_dmaps() {
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let dmap_name = dmap.name.as_bytes().to_vec();
+            let mut cb = |_hk: u64, e: &Entry| -> bool {
+                seen.insert(self.partition_for(&dmap_name, &e.key));
+                true
+            };
+            dmap.fragment.scan(&mut cb).await?;
+            let mut ids: Vec<u32> = seen.into_iter().collect();
+            ids.sort_unstable();
+            for id in ids {
+                out.push((dmap.name.clone(), id));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn export_partition(&self, dmap: &str, partition_id: u32) -> Result<Vec<u8>> {
+        let Some(handle) = self.dmaps.read().get(dmap).cloned() else {
+            // Exporting a DMap that doesn't exist locally yields an empty
+            // payload — caller treats this as a no-op migration.
+            return Ok(encode_fragment_payload(partition_id, &[]));
+        };
+        let dmap_bytes = dmap.as_bytes().to_vec();
+        let mut entries: Vec<Entry> = Vec::new();
+        let now = handle.now_nanos();
+        let mut cb = |_hk: u64, e: &Entry| -> bool {
+            // Skip expired entries — they would be lazily purged on read
+            // anyway, and shipping them across the wire wastes bandwidth.
+            if e.is_expired(now) {
+                return true;
+            }
+            if self.partition_for(&dmap_bytes, &e.key) == partition_id {
+                entries.push(e.clone());
+            }
+            true
+        };
+        handle.fragment.scan(&mut cb).await?;
+        Ok(encode_fragment_payload(partition_id, &entries))
+    }
+
+    async fn import_partition(&self, dmap: &str, partition_id: u32, payload: &[u8]) -> Result<u32> {
+        let (embedded_part, entries) = decode_fragment_payload(payload)?;
+        if embedded_part != partition_id {
+            return Err(Error::InvalidArgument(format!(
+                "fragment payload partition_id {embedded_part} != verb partition_id {partition_id}"
+            )));
+        }
+        // Get-or-create the destination DMap with default options. The
+        // receiving node has no per-DMap TOML overrides for an arbitrary
+        // peer's DMap; defaults are the correct fallback. If the operator
+        // pre-configured the DMap in TOML, that registration ran during
+        // boot and `get_or_create` returns the existing handle.
+        let handle = self.get_or_create(dmap, DMapOptions::default());
+        let mut applied = 0_u32;
+        for entry in entries {
+            // Translate the storage hkey from the in-memory hasher (the same
+            // one the receiver uses for puts/gets).
+            let hkey = handle.hkey_bytes(&entry.key);
+            let won = handle.fragment.put_lww(hkey, &entry).await?;
+            if won {
+                applied += 1;
+                // Advance the receiver's LWW floor so subsequent local writes
+                // never silently regress under the just-imported peer stamp.
+                handle.observe_lww_timestamp(entry.timestamp_nanos);
+            }
+        }
+        Ok(applied)
+    }
+
+    async fn clear_partition(&self, dmap: &str, partition_id: u32) -> Result<u32> {
+        let Some(handle) = self.dmaps.read().get(dmap).cloned() else {
+            return Ok(0);
+        };
+        let dmap_bytes = dmap.as_bytes().to_vec();
+        let mut victims: Vec<u64> = Vec::new();
+        let mut cb = |hk: u64, e: &Entry| -> bool {
+            if self.partition_for(&dmap_bytes, &e.key) == partition_id {
+                victims.push(hk);
+            }
+            true
+        };
+        handle.fragment.scan(&mut cb).await?;
+        let mut deleted = 0_u32;
+        for hk in victims {
+            if handle.fragment.delete(hk).await? {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 }
 
@@ -202,6 +308,13 @@ impl EmbeddedDMap {
 
     fn hkey(&self, key: &str) -> u64 {
         self.deps.hasher.hash64(key.as_bytes())
+    }
+
+    /// Same as [`Self::hkey`] but for already-decoded byte slices. Used by
+    /// the Phase 6 migration import path so the receiver hashes the entry's
+    /// raw key bytes with the same hasher instance the sender's writes used.
+    pub(crate) fn hkey_bytes(&self, key: &[u8]) -> u64 {
+        self.deps.hasher.hash64(key)
     }
 
     fn now_nanos(&self) -> i64 {
@@ -1090,5 +1203,182 @@ mod tests {
             .unwrap();
         assert!(!applied, "older TS must lose the LWW merge");
         assert_eq!(d.get("k").await.unwrap().value, b"new");
+    }
+
+    // ---- Phase 6 partition migration ----------------------------------------
+
+    /// Multi-partition deps so the partition_for filter actually buckets keys
+    /// into more than one bucket.
+    fn deps_multi(partition_count: u32) -> EmbeddedDeps {
+        EmbeddedDeps {
+            partition_count,
+            ..deps()
+        }
+    }
+
+    #[tokio::test]
+    async fn local_partitions_lists_every_distinct_bucket() {
+        let c = EmbeddedClient::new(deps_multi(8));
+        let d = c.new_dmap("dm", DMapOptions::default()).await.unwrap();
+        // 256 keys cover every partition with very high probability for 8
+        // partitions under xxHash.
+        for i in 0..256 {
+            d.put(&format!("k{i:03}"), b"v", PutOptions::default())
+                .await
+                .unwrap();
+        }
+        let parts = c.local_partitions().await.unwrap();
+        assert!(!parts.is_empty());
+        assert!(parts.iter().all(|(name, _)| name == "dm"));
+        let distinct: std::collections::HashSet<u32> = parts.iter().map(|(_, p)| *p).collect();
+        assert!(
+            distinct.len() >= 4,
+            "expected ≥ 4 distinct partitions with 256 keys / 8 buckets, got {}",
+            distinct.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn export_partition_filters_by_routing_hash() {
+        let c = EmbeddedClient::new(deps_multi(8));
+        let d = c.new_dmap("dm", DMapOptions::default()).await.unwrap();
+        for i in 0..64 {
+            d.put(&format!("k{i:02}"), b"v", PutOptions::default())
+                .await
+                .unwrap();
+        }
+        // Pick a single partition we know has at least one key.
+        let parts = c.local_partitions().await.unwrap();
+        let (_, target) = parts.first().cloned().expect("at least one partition");
+        let payload = c.export_partition("dm", target).await.unwrap();
+        let (back_part, entries) = decode_fragment_payload(&payload).unwrap();
+        assert_eq!(back_part, target);
+        assert!(!entries.is_empty());
+        for e in &entries {
+            let p = c.partition_for(b"dm", &e.key);
+            assert_eq!(p, target, "every exported entry must hash into {target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn import_partition_lww_merges_into_destination() {
+        let src = EmbeddedClient::new(deps_multi(4));
+        let dst = EmbeddedClient::new(deps_multi(4));
+        let _ = src.new_dmap("dm", DMapOptions::default()).await.unwrap();
+        // Seed source with 32 keys, then export every partition the keys
+        // landed in. Receiver imports each blob and ends up with the same
+        // (key -> value) view.
+        let d_src = src.get_or_create("dm", DMapOptions::default());
+        for i in 0..32 {
+            d_src
+                .put(
+                    &format!("k{i:02}"),
+                    format!("v{i:02}").as_bytes(),
+                    PutOptions {
+                        timestamp: Some(1000 + i64::from(i)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        for (dmap, part) in src.local_partitions().await.unwrap() {
+            let payload = src.export_partition(&dmap, part).await.unwrap();
+            let applied = dst.import_partition(&dmap, part, &payload).await.unwrap();
+            assert!(applied > 0, "import must accept fresh entries");
+        }
+        // Spot-check every key.
+        let d_dst = dst.get_or_create("dm", DMapOptions::default());
+        for i in 0..32 {
+            let got = d_dst.get(&format!("k{i:02}")).await.unwrap();
+            assert_eq!(got.as_str().unwrap(), format!("v{i:02}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn import_partition_rejects_payload_partition_mismatch() {
+        let src = EmbeddedClient::new(deps_multi(4));
+        let dst = EmbeddedClient::new(deps_multi(4));
+        let _ = src.new_dmap("dm", DMapOptions::default()).await.unwrap();
+        let d_src = src.get_or_create("dm", DMapOptions::default());
+        d_src.put("k", b"v", PutOptions::default()).await.unwrap();
+        let parts = src.local_partitions().await.unwrap();
+        let (dmap, part) = parts.into_iter().next().unwrap();
+        let payload = src.export_partition(&dmap, part).await.unwrap();
+        // Replay against a *different* partition id — receiver must refuse.
+        let wrong = (part + 1) % 4;
+        let err = dst
+            .import_partition(&dmap, wrong, &payload)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn import_partition_lww_preserves_newer_destination_entry() {
+        let src = EmbeddedClient::new(deps_multi(2));
+        let dst = EmbeddedClient::new(deps_multi(2));
+        let _ = src.new_dmap("dm", DMapOptions::default()).await.unwrap();
+        let _ = dst.new_dmap("dm", DMapOptions::default()).await.unwrap();
+        let d_src = src.get_or_create("dm", DMapOptions::default());
+        let d_dst = dst.get_or_create("dm", DMapOptions::default());
+
+        // Destination holds the newer write; source ships an older copy that
+        // must lose the LWW merge.
+        d_src
+            .put(
+                "shared",
+                b"old",
+                PutOptions {
+                    timestamp: Some(100),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        d_dst
+            .put(
+                "shared",
+                b"new",
+                PutOptions {
+                    timestamp: Some(200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let parts = src.local_partitions().await.unwrap();
+        let (dmap, part) = parts.into_iter().next().unwrap();
+        let payload = src.export_partition(&dmap, part).await.unwrap();
+        let applied = dst.import_partition(&dmap, part, &payload).await.unwrap();
+        assert_eq!(applied, 0, "older payload entry must lose merge");
+        assert_eq!(d_dst.get("shared").await.unwrap().value, b"new");
+    }
+
+    #[tokio::test]
+    async fn clear_partition_removes_only_matching_entries() {
+        let c = EmbeddedClient::new(deps_multi(4));
+        let d = c.new_dmap("dm", DMapOptions::default()).await.unwrap();
+        for i in 0..40 {
+            d.put(&format!("k{i:02}"), b"v", PutOptions::default())
+                .await
+                .unwrap();
+        }
+        let parts = c.local_partitions().await.unwrap();
+        let (dmap, target) = parts.first().cloned().expect("at least one partition");
+        let before_total = c.local_partitions().await.unwrap().len();
+        let cleared = c.clear_partition(&dmap, target).await.unwrap();
+        assert!(cleared > 0);
+        // After clearing, the target partition must be gone from
+        // local_partitions, but other partitions persist.
+        let after = c.local_partitions().await.unwrap();
+        let still_has_target = after.iter().any(|(_, p)| *p == target);
+        assert!(!still_has_target, "cleared partition must vanish");
+        assert!(
+            after.len() < before_total,
+            "expected fewer partitions after clear: before={before_total} after={}",
+            after.len()
+        );
     }
 }

@@ -108,6 +108,51 @@ pub enum Command {
     /// is missing. Restricted to peers authenticated with
     /// `cluster_secret`; external clients never see this command shape.
     InternalNodeGetWithTs { dmap: Bytes, key: Bytes },
+    /// `INTERNAL.NODE.MOVEFRAGMENT <partition_id> <partition_type> <dmap> <payload>`
+    /// — Phase 6 fragment migration. Sender exports the entries for
+    /// `(dmap, partition_id)` and ships them to the new owner; receiver
+    /// LWW-merges into local storage. `partition_type` is `0` for primary and
+    /// `1` for backup (reserved for future use — Phase 6 only ships primary
+    /// migrations). Restricted to peers authenticated with `cluster_secret`.
+    /// See `docs/12-failure-handling.md` "Ownership Transfer Protocol".
+    InternalNodeMoveFragment {
+        partition_id: u32,
+        partition_type: PartitionType,
+        dmap: Bytes,
+        payload: Bytes,
+    },
+}
+
+/// Fragment-migration ownership semantics.
+///
+/// Phase 6 only ships [`Self::Primary`] migrations; [`Self::Backup`] is
+/// reserved so the wire shape stays stable when backup-side fragment moves
+/// land in Phase 11 (rolling-upgrade scenarios where the new primary
+/// inherits an old backup's data before the source dies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PartitionType {
+    Primary = 0,
+    Backup = 1,
+}
+
+impl PartitionType {
+    /// Wire byte representation; the verb argument is a single ASCII digit
+    /// `0` or `1` so receivers parse it as a plain integer.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`Self::as_u8`].
+    #[must_use]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Primary),
+            1 => Some(Self::Backup),
+            _ => None,
+        }
+    }
 }
 
 /// Optional flags for `DM.PUT`.
@@ -205,6 +250,7 @@ impl Command {
             b"INTERNAL.NODE.UPDATEROUTING" => parse_internal_update_routing(args),
             b"INTERNAL.NODE.LENGTHOFPART" => parse_internal_length_of_part(args),
             b"INTERNAL.NODE.GETWITHTS" => parse_internal_get_with_ts(args),
+            b"INTERNAL.NODE.MOVEFRAGMENT" => parse_internal_move_fragment(args),
             _ => Err(CommandError::UnknownCommand(
                 String::from_utf8_lossy(verb_lower).into_owned(),
             )),
@@ -335,6 +381,18 @@ impl Command {
                 bulk("INTERNAL.NODE.GETWITHTS"),
                 bulk_bytes(dmap),
                 bulk_bytes(key),
+            ],
+            Self::InternalNodeMoveFragment {
+                partition_id,
+                partition_type,
+                dmap,
+                payload,
+            } => vec![
+                bulk("INTERNAL.NODE.MOVEFRAGMENT"),
+                bulk(&partition_id.to_string()),
+                bulk(&partition_type.as_u8().to_string()),
+                bulk_bytes(dmap),
+                Frame::Bulk(BulkString::from_bytes(payload.clone())),
             ],
         };
         Frame::Array(Some(parts))
@@ -626,6 +684,29 @@ fn parse_internal_get_with_ts(args: Vec<Bytes>) -> Result<Command, CommandError>
     Ok(Command::InternalNodeGetWithTs {
         dmap: iter.next().unwrap(),
         key: iter.next().unwrap(),
+    })
+}
+
+fn parse_internal_move_fragment(args: Vec<Bytes>) -> Result<Command, CommandError> {
+    require_exact(&args, "INTERNAL.NODE.MOVEFRAGMENT", 4)?;
+    let mut iter = args.into_iter();
+    let _verb = iter.next();
+    let partition_raw = iter.next().unwrap();
+    let type_raw = iter.next().unwrap();
+    let dmap = iter.next().unwrap();
+    let payload = iter.next().unwrap();
+    let partition_id = parse_int(&partition_raw, "INTERNAL.NODE.MOVEFRAGMENT", "partition_id")?;
+    let type_byte: u8 = parse_int(&type_raw, "INTERNAL.NODE.MOVEFRAGMENT", "partition_type")?;
+    let partition_type =
+        PartitionType::from_u8(type_byte).ok_or_else(|| CommandError::InvalidArgument {
+            command: "INTERNAL.NODE.MOVEFRAGMENT",
+            reason: format!("unknown partition_type byte {type_byte}"),
+        })?;
+    Ok(Command::InternalNodeMoveFragment {
+        partition_id,
+        partition_type,
+        dmap,
+        payload,
     })
 }
 
@@ -1403,6 +1484,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_internal_move_fragment_roundtrip() {
+        let cmd = Command::InternalNodeMoveFragment {
+            partition_id: 42,
+            partition_type: PartitionType::Primary,
+            dmap: b("sessions"),
+            payload: Bytes::from_static(b"\x01\x00\x00\x00\x00"),
+        };
+        assert_eq!(Command::parse(cmd.to_frame()).unwrap(), cmd);
+    }
+
+    #[test]
+    fn parse_internal_move_fragment_wrong_arity() {
+        let frame = arr(&[b"INTERNAL.NODE.MOVEFRAGMENT", b"0", b"0", b"dm"]);
+        assert_matches!(Command::parse(frame), Err(CommandError::WrongArity { .. }));
+    }
+
+    #[test]
+    fn parse_internal_move_fragment_rejects_unknown_type() {
+        let frame = arr(&[
+            b"INTERNAL.NODE.MOVEFRAGMENT",
+            b"0",
+            b"9", // not a valid PartitionType byte
+            b"dm",
+            b"payload",
+        ]);
+        assert_matches!(
+            Command::parse(frame),
+            Err(CommandError::InvalidArgument {
+                command: "INTERNAL.NODE.MOVEFRAGMENT",
+                ..
+            })
+        );
+    }
+
+    #[test]
+    fn parse_internal_move_fragment_accepts_backup_type() {
+        let frame = arr(&[b"INTERNAL.NODE.MOVEFRAGMENT", b"7", b"1", b"dm", b"payload"]);
+        let Command::InternalNodeMoveFragment { partition_type, .. } =
+            Command::parse(frame).unwrap()
+        else {
+            panic!("expected MoveFragment");
+        };
+        assert_eq!(partition_type, PartitionType::Backup);
+    }
+
+    #[test]
     fn parse_unknown_verb() {
         let frame = arr(&[b"NOPE"]);
         assert_matches!(Command::parse(frame), Err(CommandError::UnknownCommand(s)) if s == "NOPE");
@@ -1639,6 +1766,20 @@ mod tests {
                 .prop_map(|partition_id| Command::InternalNodeLengthOfPart { partition_id }),
             (bytes_strategy(), bytes_strategy())
                 .prop_map(|(dmap, key)| Command::InternalNodeGetWithTs { dmap, key }),
+            (
+                any::<u32>(),
+                prop_oneof![Just(PartitionType::Primary), Just(PartitionType::Backup)],
+                bytes_strategy(),
+                bytes_strategy(),
+            )
+                .prop_map(|(partition_id, partition_type, dmap, payload)| {
+                    Command::InternalNodeMoveFragment {
+                        partition_id,
+                        partition_type,
+                        dmap,
+                        payload,
+                    }
+                }),
         ]
     }
 

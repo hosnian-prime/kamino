@@ -27,6 +27,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::balancer::{
+    BalancerParams, ClusterEventsSink, ForwarderTransport, MigrationSource, MigrationTransport,
+    TracingEventsSink, run_balancer_loop,
+};
 use crate::discovery::DiscoveryPlugin;
 use crate::error::{ClusterError, ClusterResult};
 use crate::forwarder::{Forwarder, ForwarderConfig};
@@ -86,6 +90,7 @@ pub struct Cluster {
     routing_config: kamino_core::config::RoutingConfig,
     network_config: kamino_core::config::NetworkConfig,
     member_count_quorum: u32,
+    balancer_trigger_interval: std::time::Duration,
 }
 
 impl Cluster {
@@ -135,6 +140,7 @@ impl Cluster {
             routing_config: deps.config.routing.clone(),
             network_config: deps.config.network.clone(),
             member_count_quorum: deps.config.core.member_count_quorum,
+            balancer_trigger_interval: deps.config.balancer.trigger_interval,
         }
     }
 
@@ -303,6 +309,49 @@ impl Cluster {
     #[must_use]
     pub fn transport(&self) -> Arc<dyn Transport> {
         Arc::clone(&self.transport)
+    }
+
+    /// Spawn the Phase 6 balancer loop. The server runtime owns the
+    /// `MigrationSource` (which knows how to scan local storage) and
+    /// optionally a custom `events` sink — defaults to a tracing-only
+    /// adapter.
+    ///
+    /// Returns silently if no forwarder is available (test deployments
+    /// that wire a custom `RoutingPusher` and skip the real one): the
+    /// balancer can't migrate without a transport. Tests that need to
+    /// drive the balancer manually call [`crate::run_tick`] directly.
+    pub fn spawn_balancer(
+        &self,
+        source: Arc<dyn MigrationSource>,
+        events: Option<Arc<dyn ClusterEventsSink>>,
+    ) {
+        let Some(fwd) = self.forwarder.clone() else {
+            debug!("no forwarder available; balancer loop will not run");
+            return;
+        };
+        let transport: Arc<dyn MigrationTransport> = Arc::new(ForwarderTransport::new(fwd));
+        let events: Arc<dyn ClusterEventsSink> =
+            events.unwrap_or_else(|| Arc::new(TracingEventsSink));
+        let params = BalancerParams {
+            local_id: self.local_id,
+            store: Arc::clone(&self.routing_store),
+            source,
+            transport,
+            trigger_interval: self.balancer_trigger_interval,
+            cancel: self.cancel.clone(),
+            events,
+        };
+        let handle = tokio::spawn(async move {
+            run_balancer_loop(params).await;
+        });
+        self.tasks.lock().push(handle);
+        debug!("balancer loop spawned");
+    }
+
+    /// `[balancer]` trigger interval (for tests + diagnostics).
+    #[must_use]
+    pub const fn balancer_trigger_interval(&self) -> std::time::Duration {
+        self.balancer_trigger_interval
     }
 
     /// Discovery plugin handle.
@@ -522,6 +571,18 @@ pub trait RoutingProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Previous owners for the partition holding `(dmap, key)` — every
+    /// entry in `RoutingTable::primary[part]` after index 0. Used by the
+    /// Phase 6 fragmented-partition read path: after a topology change,
+    /// reads on the new primary fall back to previous owners until the
+    /// balancer migrates the data. Returns an empty vec for non-fragmented
+    /// partitions or when this node isn't on the primary side.
+    ///
+    /// Phase 6 — `docs/12-failure-handling.md` "Behavior During Fragmentation".
+    fn previous_owners_for_key(&self, _dmap_name: &[u8], _key: &[u8]) -> Vec<SocketAddr> {
+        Vec::new()
+    }
+
     /// Whether the live member count satisfies `member_count_quorum`.
     /// Returns `true` for standalone deployments (single-member quorum).
     ///
@@ -645,6 +706,27 @@ impl RoutingProvider for Cluster {
             return Vec::new();
         }
         snap.backups_for(part).iter().map(|m| m.addr).collect()
+    }
+
+    fn previous_owners_for_key(&self, dmap_name: &[u8], key: &[u8]) -> Vec<SocketAddr> {
+        let Some(snap) = self.routing_store.snapshot() else {
+            return Vec::new();
+        };
+        let part = crate::routing::partition_for(
+            self.hasher.as_ref(),
+            dmap_name,
+            key,
+            self.core_config.partition_count,
+        );
+        let owners = snap.owners_for(part);
+        // Index 0 is the current primary; the rest are prior owners from a
+        // recent topology transition. Only emit the prior list when this
+        // node is itself the current primary — non-primaries hit MOVED, not
+        // a fragmented-read path.
+        if owners.first().map(|m| m.id) != Some(self.local_id) {
+            return Vec::new();
+        }
+        owners.iter().skip(1).map(|m| m.addr).collect()
     }
 
     fn member_quorum_satisfied(&self) -> bool {

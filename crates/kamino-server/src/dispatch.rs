@@ -198,6 +198,21 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
         Command::InternalNodeGetWithTs { dmap, key } => {
             handlers::internal_node_get_with_ts(&ctx.client, &dmap, &key).await
         }
+        Command::InternalNodeMoveFragment {
+            partition_id,
+            partition_type,
+            dmap,
+            payload,
+        } => {
+            handlers::internal_node_move_fragment(
+                &ctx.client,
+                partition_id,
+                partition_type,
+                &dmap,
+                &payload,
+            )
+            .await
+        }
     }
 }
 
@@ -245,6 +260,7 @@ fn is_internal_allowed(ctx: &ServerContext, state: &ConnState, cmd: &Command) ->
         Command::InternalNodeUpdateRouting { .. }
             | Command::InternalNodeLengthOfPart { .. }
             | Command::InternalNodeGetWithTs { .. }
+            | Command::InternalNodeMoveFragment { .. }
     );
     if !is_internal {
         return true;

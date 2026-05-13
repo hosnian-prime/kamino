@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use kamino_cluster::RoutingProvider;
+use kamino_client::Client;
+use kamino_cluster::{ClusterError, ClusterResult, MigrationSource, RoutingProvider};
 use kamino_protocol::{Command, Frame, PutCommandOptions};
 use tracing::warn;
 
@@ -259,5 +260,44 @@ mod tests {
             next > far,
             "next must exceed observed floor {far}, got {next}"
         );
+    }
+}
+
+/// Adapter that lets the cluster-level `Balancer` drive an `Arc<dyn Client>`
+/// as a [`MigrationSource`]. Phase 6 — `docs/12-failure-handling.md`.
+#[derive(Debug)]
+pub(crate) struct ClientMigrationSource {
+    client: Arc<dyn Client>,
+}
+
+impl ClientMigrationSource {
+    pub(crate) const fn new(client: Arc<dyn Client>) -> Self {
+        Self { client }
+    }
+}
+
+fn into_cluster_err(e: &kamino_client::Error) -> ClusterError {
+    ClusterError::Codec(format!("migration source: {e}"))
+}
+
+#[async_trait::async_trait]
+impl MigrationSource for ClientMigrationSource {
+    async fn local_partitions(&self) -> ClusterResult<Vec<(String, u32)>> {
+        self.client
+            .local_partitions()
+            .await
+            .map_err(|e| into_cluster_err(&e))
+    }
+    async fn export_partition(&self, dmap: &str, partition_id: u32) -> ClusterResult<Vec<u8>> {
+        self.client
+            .export_partition(dmap, partition_id)
+            .await
+            .map_err(|e| into_cluster_err(&e))
+    }
+    async fn clear_partition(&self, dmap: &str, partition_id: u32) -> ClusterResult<u32> {
+        self.client
+            .clear_partition(dmap, partition_id)
+            .await
+            .map_err(|e| into_cluster_err(&e))
     }
 }

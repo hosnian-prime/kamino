@@ -149,7 +149,7 @@ pub async fn run_coordinator_loop(params: CoordinatorParams, signature: Arc<Sign
         let topology_changed = last_topology_hash != Some(topo);
         if topology_changed {
             let next_sig = signature.next();
-            let Some(table) = RoutingTable::build(
+            let Some(mut table) = RoutingTable::build(
                 snapshot.clone(),
                 params.hasher.as_ref(),
                 params.partition_count,
@@ -161,6 +161,14 @@ pub async fn run_coordinator_loop(params: CoordinatorParams, signature: Arc<Sign
                 warn!("routing-table build returned None despite non-empty members");
                 continue;
             };
+
+            // Phase 6: preserve previous owners on partitions whose primary
+            // changed. The balancer on the old owner uses this list to
+            // migrate orphaned data; reads on the new primary fall back to
+            // it until migration completes (`docs/12-failure-handling.md`).
+            if let Some(prev) = current_table.as_ref() {
+                preserve_previous_owners(&mut table, prev, &snapshot);
+            }
 
             let local = params.store.apply(table.clone());
             match local {
@@ -231,6 +239,51 @@ async fn push_to_peers(params: &CoordinatorParams, members: &[Member], bytes: &[
     }
 }
 
+/// Splice previous primaries onto each partition whose owner just changed.
+/// Only owners that survived into `live` are preserved — a dead node has no
+/// data to migrate from, so listing it as a fallback would just hand the
+/// fragmented-read path a guaranteed timeout.
+fn preserve_previous_owners(new: &mut RoutingTable, prev: &RoutingTable, live: &[Member]) {
+    use std::collections::HashSet;
+    let live_ids: HashSet<_> = live.iter().map(|m| m.id).collect();
+    for (part, owners_new) in &mut new.primary {
+        let Some(prev_owners) = prev.primary.get(part) else {
+            continue;
+        };
+        let Some(prev_primary) = prev_owners.first() else {
+            continue;
+        };
+        let Some(new_primary_id) = owners_new.first().map(|m| m.id) else {
+            continue;
+        };
+        if prev_primary.id == new_primary_id {
+            // Primary unchanged — no fragmentation. Drop any prior
+            // fragmented owners since the migration window has closed.
+            continue;
+        }
+        if !live_ids.contains(&prev_primary.id) {
+            // Previous primary died; nothing to fall back to. Drop the
+            // fragmented entry entirely so reads don't hang waiting on a
+            // dead peer.
+            continue;
+        }
+        // Append-after-head: keep current primary at index 0 and append the
+        // previous primary + any further previous owners that survived.
+        for ancestor in prev_owners {
+            if ancestor.id == new_primary_id {
+                continue;
+            }
+            if !live_ids.contains(&ancestor.id) {
+                continue;
+            }
+            if owners_new.iter().any(|m| m.id == ancestor.id) {
+                continue;
+            }
+            owners_new.push(ancestor.clone());
+        }
+    }
+}
+
 fn topology_hash(members: &[Member]) -> u64 {
     // Order-independent hash so member-list shuffles that don't actually
     // change membership don't trip a push. `(id, birthdate)` pairs are
@@ -287,6 +340,60 @@ mod tests {
         let a = [mk(1, 100, 3320), mk(2, 200, 3322)];
         let b = [mk(1, 100, 3320), mk(2, 200, 3322), mk(3, 300, 3324)];
         assert_ne!(topology_hash(&a), topology_hash(&b));
+    }
+
+    #[test]
+    fn preserve_previous_owners_appends_old_primary() {
+        let a = mk(1, 100, 3320);
+        let b = mk(2, 200, 3322);
+        let h = XxHasher;
+        // Two-member table where `a` owns every partition.
+        let prev = RoutingTable::build(vec![a.clone()], &h, 4, 4, 1.25, 1, 1).unwrap();
+        // Rebuild after `b` joins → some partitions transfer to `b`.
+        let mut new =
+            RoutingTable::build(vec![a.clone(), b.clone()], &h, 4, 4, 1.25, 1, 2).unwrap();
+        preserve_previous_owners(&mut new, &prev, &[a, b]);
+        // Find a partition whose primary actually changed.
+        let mut had_fragmented = false;
+        for (part, owners) in &new.primary {
+            let prev_p = prev.primary.get(part).and_then(|v| v.first()).unwrap();
+            let new_p = owners.first().unwrap();
+            if prev_p.id == new_p.id {
+                assert_eq!(
+                    owners.len(),
+                    1,
+                    "unchanged partition must drop fragmented tail",
+                );
+            } else {
+                had_fragmented = true;
+                assert!(
+                    owners.iter().any(|m| m.id == prev_p.id),
+                    "changed partition must preserve previous primary",
+                );
+            }
+        }
+        assert!(
+            had_fragmented,
+            "expected at least one partition to change owner after joining `b`",
+        );
+    }
+
+    #[test]
+    fn preserve_previous_owners_drops_dead_ancestors() {
+        let a = mk(1, 100, 3320);
+        let b = mk(2, 200, 3322);
+        let h = XxHasher;
+        let prev = RoutingTable::build(vec![a], &h, 4, 4, 1.25, 1, 1).unwrap();
+        // Member `a` died; the new table only has `b`.
+        let mut new = RoutingTable::build(vec![b.clone()], &h, 4, 4, 1.25, 1, 2).unwrap();
+        preserve_previous_owners(&mut new, &prev, &[b.clone()]);
+        for owners in new.primary.values() {
+            assert!(
+                owners.iter().all(|m| m.id == b.id),
+                "dead ancestor must not appear in fragmented-owner list",
+            );
+            assert_eq!(owners.len(), 1);
+        }
     }
 
     #[tokio::test(start_paused = true)]

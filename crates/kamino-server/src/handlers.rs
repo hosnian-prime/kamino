@@ -503,6 +503,24 @@ pub(crate) async fn dm_get(
             |r| Response::ok(Frame::Bulk(BulkString::from(r.value))),
         );
     };
+
+    // Phase 6 fragmented-partition fallback: if local missed AND the
+    // routing table still lists previous owners for this partition (we
+    // were just promoted and the balancer hasn't migrated yet), query
+    // those owners sequentially. The first hit wins; ties are resolved by
+    // highest timestamp on the way back. This precedes the read_quorum
+    // fan-out because a fragmented partition by definition can't satisfy
+    // the steady-state replica set yet.
+    if local.is_none() {
+        let prior = routing.previous_owners_for_key(dmap, key);
+        if !prior.is_empty() {
+            let recovered =
+                read_from_prior_owners(routing, &prior, dmap.clone(), key.clone()).await;
+            if let Some((value, _ts)) = recovered {
+                return Response::ok(Frame::Bulk(BulkString::from(value)));
+            }
+        }
+    }
     let settings = routing.replication_settings();
     let needs_fanout = settings.read_quorum > 1 || settings.read_repair;
     if !needs_fanout {
@@ -570,6 +588,19 @@ fn pick_highest_ts(replies: &[Option<(Vec<u8>, i64)>]) -> Option<(Vec<u8>, i64)>
         .map(|(v, ts)| (v.clone(), *ts))
 }
 
+/// Query every previous owner in parallel via `INTERNAL.NODE.GETWITHTS`
+/// and return the highest-timestamp hit, if any. Used by Phase 6's
+/// fragmented-partition read fallback in [`dm_get`].
+async fn read_from_prior_owners(
+    routing: &Arc<dyn RoutingProvider>,
+    prior: &[std::net::SocketAddr],
+    dmap: Bytes,
+    key: Bytes,
+) -> Option<(Vec<u8>, i64)> {
+    let replies = replication::read_from_backups(routing, prior, dmap, key).await;
+    pick_highest_ts(&replies)
+}
+
 /// Identify backups whose stored timestamp is strictly below the winner
 /// (or who returned no value at all). The primary's local copy is the
 /// last entry in `replies`; backups occupy the first `backups.len()`
@@ -613,6 +644,56 @@ pub(crate) async fn internal_node_get_with_ts(
         ]))),
         Err(ClientError::KeyNotFound) => Response::ok(Frame::Bulk(BulkString::null())),
         Err(e) => Response::ok(map_client_error(e, "INTERNAL.NODE.GETWITHTS")),
+    }
+}
+
+/// Handler for `INTERNAL.NODE.MOVEFRAGMENT`. The balancer on the previous
+/// owner exports a `(dmap, partition_id)` shard and ships it here; we
+/// LWW-merge into local storage and reply `+OK` (or `-ERR <reason>` on
+/// decode / merge failure). Phase 6 — `docs/12-failure-handling.md`
+/// "Ownership Transfer Protocol".
+pub(crate) async fn internal_node_move_fragment(
+    client: &Arc<dyn Client>,
+    partition_id: u32,
+    partition_type: kamino_protocol::PartitionType,
+    dmap: &Bytes,
+    payload: &[u8],
+) -> Response {
+    // Phase 6 only ships primary migrations; backup migrations are reserved
+    // (see protocol command doc). Reject the off-spec type explicitly so a
+    // future-version sender gets a clear error rather than a silent merge
+    // under the wrong ownership semantics.
+    if partition_type != kamino_protocol::PartitionType::Primary {
+        return Response::ok(Frame::Error(
+            "ERR MOVEFRAGMENT backup-type migrations are not supported in this version".into(),
+        ));
+    }
+    let dmap_name = match key_str(dmap) {
+        Ok(s) => s.to_string(),
+        Err(f) => return Response::ok(f),
+    };
+    match client
+        .import_partition(&dmap_name, partition_id, payload)
+        .await
+    {
+        Ok(applied) => {
+            tracing::info!(
+                dmap = %dmap_name,
+                partition_id,
+                applied,
+                "INTERNAL.NODE.MOVEFRAGMENT accepted",
+            );
+            Response::ok(Frame::ok())
+        }
+        Err(e) => {
+            tracing::warn!(
+                dmap = %dmap_name,
+                partition_id,
+                error = %e,
+                "INTERNAL.NODE.MOVEFRAGMENT rejected",
+            );
+            Response::ok(map_client_error(e, "INTERNAL.NODE.MOVEFRAGMENT"))
+        }
     }
 }
 
