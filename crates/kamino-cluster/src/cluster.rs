@@ -469,6 +469,19 @@ impl MemberProvider for Cluster {
     }
 }
 
+/// Replication tuning surfaced to the RESP server. Mirrors the relevant
+/// `[core]` knobs from `kamino-core::config::CoreConfig` so the server
+/// can enforce write/read quorum at the op boundary without re-reading
+/// the full config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationSettings {
+    pub replica_count: u32,
+    pub write_quorum: u32,
+    pub read_quorum: u32,
+    pub read_repair: bool,
+    pub mode: kamino_core::ReplicationMode,
+}
+
 /// Trait the RESP server calls for `CLUSTER.ROUTINGTABLE`, `CLUSTER.READY`,
 /// and `INTERNAL.NODE.UPDATEROUTING`.
 ///
@@ -499,6 +512,57 @@ pub trait RoutingProvider: Send + Sync {
     /// Whether the server must reject multi-key requests that cross
     /// partitions (`network.multi_key_strict`).
     fn multi_key_strict(&self) -> bool;
+
+    /// Live backup addresses for the partition owning `(dmap, key)`.
+    /// Empty when this node is *not* the primary for that partition
+    /// (replication fan-out only runs on the primary).
+    ///
+    /// Phase 5 — `docs/04-replication.md` "Backup Owner Selection".
+    fn backup_addrs_for_key(&self, _dmap_name: &[u8], _key: &[u8]) -> Vec<SocketAddr> {
+        Vec::new()
+    }
+
+    /// Whether the live member count satisfies `member_count_quorum`.
+    /// Returns `true` for standalone deployments (single-member quorum).
+    ///
+    /// Phase 5 — `docs/04-replication.md` "Member Count Quorum".
+    fn member_quorum_satisfied(&self) -> bool {
+        true
+    }
+
+    /// Current replication tuning. Default values match the
+    /// shipped `Config::default()` (single-replica, sync, no read repair).
+    fn replication_settings(&self) -> ReplicationSettings {
+        ReplicationSettings {
+            replica_count: 1,
+            write_quorum: 1,
+            read_quorum: 1,
+            read_repair: false,
+            mode: kamino_core::ReplicationMode::Sync,
+        }
+    }
+
+    /// Forward an arbitrary RESP command to `peer` and return the raw reply
+    /// frame. The caller interprets the frame shape — used by Phase 5
+    /// replication fan-out so the server handler can apply per-command
+    /// reply parsing without baking it into the trait.
+    fn forward_command<'a>(
+        &'a self,
+        _peer: SocketAddr,
+        _cmd: kamino_protocol::Command,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<kamino_protocol::Frame, ClusterError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(ClusterError::ServerGone(
+                "forward_command unimplemented on this RoutingProvider".into(),
+            ))
+        })
+    }
 
     /// Forward an already-grouped `DM.DEL <dmap> <keys...>` to `peer` and
     /// return the deleted-count.
@@ -559,6 +623,65 @@ impl RoutingProvider for Cluster {
 
     fn multi_key_strict(&self) -> bool {
         self.network_config.multi_key_strict
+    }
+
+    fn backup_addrs_for_key(&self, dmap_name: &[u8], key: &[u8]) -> Vec<SocketAddr> {
+        // Routing fan-out only runs on the primary. If the local node isn't
+        // primary for this partition, return empty — replication is the
+        // primary's job per `docs/04-replication.md`.
+        let Some(snap) = self.routing_store.snapshot() else {
+            return Vec::new();
+        };
+        let part = crate::routing::partition_for(
+            self.hasher.as_ref(),
+            dmap_name,
+            key,
+            self.core_config.partition_count,
+        );
+        let Some(primary) = snap.primary_for(part) else {
+            return Vec::new();
+        };
+        if primary.id != self.local_id {
+            return Vec::new();
+        }
+        snap.backups_for(part).iter().map(|m| m.addr).collect()
+    }
+
+    fn member_quorum_satisfied(&self) -> bool {
+        let live = self.view.live_count();
+        let quorum = self.member_count_quorum as usize;
+        live >= quorum
+    }
+
+    fn replication_settings(&self) -> ReplicationSettings {
+        ReplicationSettings {
+            replica_count: self.core_config.replica_count,
+            write_quorum: self.core_config.write_quorum,
+            read_quorum: self.core_config.read_quorum,
+            read_repair: self.core_config.read_repair,
+            mode: self.core_config.replication_mode,
+        }
+    }
+
+    fn forward_command<'a>(
+        &'a self,
+        peer: SocketAddr,
+        cmd: kamino_protocol::Command,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<kamino_protocol::Frame, ClusterError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let Some(fwd) = self.forwarder.clone() else {
+                return Err(ClusterError::ServerGone(format!(
+                    "forwarder unavailable; cannot reach {peer}",
+                )));
+            };
+            fwd.send(peer, cmd).await
+        })
     }
 
     fn forward_dm_del<'a>(

@@ -7,8 +7,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kamino_client::{Client, DMap, DMapOptions, Error as ClientError, PutOptions, ScanOptions};
+use kamino_cluster::RoutingProvider;
+use kamino_core::ReplicationMode;
 use kamino_protocol::{BulkString, Frame, HelloArgs};
 
+use crate::replication::{self, TimestampSource};
 use crate::state::{AuthState, ConnState};
 
 /// Side effects a handler may request from the connection loop.
@@ -325,8 +328,12 @@ fn key_str(key: &Bytes) -> Result<&str, Frame> {
     std::str::from_utf8(key).map_err(|e| Frame::Error(format!("ERR invalid key utf-8: {e}")))
 }
 
+#[allow(clippy::too_many_arguments)] // each argument is independent context
 pub(crate) async fn dm_put(
     client: &Arc<dyn Client>,
+    routing: Option<&Arc<dyn RoutingProvider>>,
+    ts_source: &TimestampSource,
+    from_peer: bool,
     dmap: &Bytes,
     key: &Bytes,
     value: &Bytes,
@@ -340,7 +347,112 @@ pub(crate) async fn dm_put(
         Ok(s) => s,
         Err(f) => return Response::ok(f),
     };
-    let put_opts = PutOptions {
+
+    // Backup-side arrival (cluster_secret-authenticated peer): the primary
+    // owns the LWW stamp, we just merge.
+    if from_peer {
+        let put_opts = put_options_from_command(&options);
+        return match d.put_lww(k, value, put_opts).await {
+            // `applied = true` is the steady-state path; `false` means an
+            // out-of-order replication arrived after a newer write and was
+            // discarded by LWW. Both outcomes are "the cluster's invariant
+            // is preserved" so we report success to the primary so it can
+            // count the ack toward `write_quorum`.
+            Ok(_) => Response::ok(Frame::ok()),
+            Err(ClientError::KeyAlreadyExists | ClientError::KeyNotExists) => {
+                Response::ok(Frame::Bulk(BulkString::null()))
+            }
+            Err(e) => Response::ok(map_client_error(e, "DM.PUT")),
+        };
+    }
+
+    // Primary path: assign a canonical timestamp, commit locally, then fan
+    // out to live backups. If `options.timestamp` is set (client TS
+    // override) we honor it and advance our floor so future stamps stay
+    // monotonic.
+    let stamp = options.timestamp.map_or_else(
+        || ts_source.next(),
+        |ts| {
+            ts_source.observe(ts);
+            ts
+        },
+    );
+    let stamped_options = kamino_protocol::PutCommandOptions {
+        timestamp: Some(stamp),
+        ..options.clone()
+    };
+    let put_opts = put_options_from_command(&stamped_options);
+
+    match d.put(k, value, put_opts).await {
+        Ok(()) => {}
+        Err(ClientError::KeyAlreadyExists | ClientError::KeyNotExists) => {
+            // NX/XX rejected: do *not* replicate — the cluster state is
+            // unchanged and backups must not see a phantom write.
+            return Response::ok(Frame::Bulk(BulkString::null()));
+        }
+        Err(e) => return Response::ok(map_client_error(e, "DM.PUT")),
+    }
+
+    let Some(routing) = routing else {
+        // Standalone (no cluster runtime): replication is a no-op.
+        return Response::ok(Frame::ok());
+    };
+    let backups = routing.backup_addrs_for_key(dmap, key);
+    if backups.is_empty() {
+        return Response::ok(Frame::ok());
+    }
+    let settings = routing.replication_settings();
+    let write_quorum = settings.write_quorum.max(1);
+
+    match settings.mode {
+        ReplicationMode::Sync => {
+            let outcome = replication::replicate_put(
+                routing,
+                &backups,
+                dmap.clone(),
+                key.clone(),
+                value.clone(),
+                stamped_options,
+            )
+            .await;
+            // Primary's own commit counts as one ack toward write_quorum.
+            let total = 1_u32 + outcome.acks;
+            if total < write_quorum {
+                let err = outcome
+                    .first_error
+                    .unwrap_or_else(|| "no backup acked in time".into());
+                return Response::ok(Frame::Error(format!(
+                    "QUORUM write_quorum={write_quorum} not met (acks={total}): {err}",
+                )));
+            }
+            Response::ok(Frame::ok())
+        }
+        ReplicationMode::Async => {
+            // Fire-and-forget; primary returns success immediately. Data
+            // loss on primary crash before propagation is the documented
+            // trade-off (`docs/04-replication.md` "Asynchronous").
+            let routing = Arc::clone(routing);
+            let dmap = dmap.clone();
+            let key = key.clone();
+            let value = value.clone();
+            tokio::spawn(async move {
+                let _ = replication::replicate_put(
+                    &routing,
+                    &backups,
+                    dmap,
+                    key,
+                    value,
+                    stamped_options,
+                )
+                .await;
+            });
+            Response::ok(Frame::ok())
+        }
+    }
+}
+
+const fn put_options_from_command(options: &kamino_protocol::PutCommandOptions) -> PutOptions {
+    PutOptions {
         ex: options.ex,
         px: options.px,
         exat: options.exat,
@@ -348,13 +460,6 @@ pub(crate) async fn dm_put(
         nx: options.nx,
         xx: options.xx,
         timestamp: options.timestamp,
-    };
-    match d.put(k, value, put_opts).await {
-        Ok(()) => Response::ok(Frame::ok()),
-        Err(ClientError::KeyAlreadyExists | ClientError::KeyNotExists) => {
-            Response::ok(Frame::Bulk(BulkString::null()))
-        }
-        Err(e) => Response::ok(map_client_error(e, "DM.PUT")),
     }
 }
 
@@ -377,6 +482,7 @@ pub(crate) async fn dm_get(client: &Arc<dyn Client>, dmap: &Bytes, key: &Bytes) 
 pub(crate) async fn dm_del(
     client: &Arc<dyn Client>,
     routing: Option<&Arc<dyn kamino_cluster::RoutingProvider>>,
+    from_peer: bool,
     dmap: &Bytes,
     keys: &[Bytes],
 ) -> Response {
@@ -384,10 +490,12 @@ pub(crate) async fn dm_del(
         return Response::ok(Frame::Integer(0));
     }
 
-    // Standalone (no routing): local delete only.
-    let Some(routing) = routing else {
+    // Standalone (no routing) OR a backup receiving a replication DEL:
+    // delete locally and reply with the count, no further fan-out.
+    if routing.is_none() || from_peer {
         return dm_del_local(client, dmap, keys).await;
-    };
+    }
+    let routing = routing.expect("checked above");
 
     // Bucket keys by primary owner. `None` = local; `Some(addr)` = remote.
     let mut buckets: std::collections::HashMap<Option<std::net::SocketAddr>, Vec<Bytes>> =
@@ -411,6 +519,14 @@ pub(crate) async fn dm_del(
         match dm_del_local_count(client, dmap, &local_keys).await {
             Ok(n) => deleted += n,
             Err(frame) => return Response::ok(frame),
+        }
+        // Phase 5: replicate every successful local delete to the partition's
+        // live backups. Single-key fan-out — multi-key DEL crossing
+        // partitions still uses `forward_dm_del` per-peer above.
+        if let Err(err) = replicate_local_deletes(routing, dmap, &local_keys).await {
+            // Replication failure surfaces as PARTIAL so callers see that
+            // the local delete happened but backups may diverge.
+            return Response::ok(Frame::SimpleString(format!("PARTIAL {deleted} {err}")));
         }
     }
     // Fan out remote buckets in parallel — bounded by the per-peer
@@ -441,6 +557,35 @@ pub(crate) async fn dm_del(
         return Response::ok(Frame::SimpleString(format!("PARTIAL {deleted} {err}")));
     }
     Response::ok(Frame::Integer(deleted))
+}
+
+/// Replicate every key the primary just deleted locally to the partition's
+/// live backups. Errors are surfaced verbatim so the caller can decide
+/// between `+OK` and `+PARTIAL`.
+async fn replicate_local_deletes(
+    routing: &Arc<dyn kamino_cluster::RoutingProvider>,
+    dmap: &Bytes,
+    keys: &[Bytes],
+) -> Result<(), String> {
+    let settings = routing.replication_settings();
+    if settings.replica_count <= 1 {
+        return Ok(());
+    }
+    for key in keys {
+        let backups = routing.backup_addrs_for_key(dmap, key);
+        if backups.is_empty() {
+            continue;
+        }
+        let outcome =
+            replication::replicate_delete(routing, &backups, dmap.clone(), key.clone()).await;
+        let total = 1_u32 + outcome.acks;
+        if total < settings.write_quorum.max(1) {
+            return Err(outcome
+                .first_error
+                .unwrap_or_else(|| "DEL replication below quorum".into()));
+        }
+    }
+    Ok(())
 }
 
 async fn dm_del_local(client: &Arc<dyn Client>, dmap: &Bytes, keys: &[Bytes]) -> Response {

@@ -23,6 +23,25 @@ pub trait DMap: Send + Sync + std::fmt::Debug {
     /// Store a key/value pair.
     async fn put(&self, key: &str, value: &[u8], options: PutOptions) -> Result<()>;
 
+    /// LWW-merge variant of [`Self::put`] used by Phase 5 backup replication.
+    ///
+    /// `options.timestamp` **must** be `Some` — the primary owns the LWW
+    /// clock and forwards its stamp to backups via the wire `TS` option.
+    /// Implementations apply the entry iff its `timestamp` is strictly
+    /// greater than the locally-stored one; otherwise the local value wins
+    /// and `Ok(false)` is returned so the caller can decide whether to
+    /// retry or treat the no-op as success.
+    ///
+    /// Default impl: `Err(Unsupported("put_lww"))`. The embedded client
+    /// (the only backend that serves replication arrivals in Phase 5)
+    /// overrides it; remote-side clients keep the default since clients
+    /// never *originate* an LWW write — they always go through the
+    /// primary's regular `put`.
+    #[doc(hidden)]
+    async fn put_lww(&self, _key: &str, _value: &[u8], _options: PutOptions) -> Result<bool> {
+        Err(crate::error::Error::Unsupported("put_lww"))
+    }
+
     /// Retrieve a value. Returns [`crate::Error::KeyNotFound`] when missing.
     async fn get(&self, key: &str) -> Result<GetResponse>;
 

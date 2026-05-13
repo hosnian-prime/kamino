@@ -13,6 +13,7 @@ mod connection;
 mod dispatch;
 mod handlers;
 mod metrics;
+mod replication;
 mod state;
 
 use std::net::SocketAddr;
@@ -167,6 +168,7 @@ impl Server {
             id,
             member_provider,
             routing_provider,
+            ts_source: Arc::new(crate::replication::TimestampSource::new()),
         });
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let settings = ConnSettings {

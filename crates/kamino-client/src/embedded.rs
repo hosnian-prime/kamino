@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -126,6 +127,11 @@ pub struct EmbeddedDMap {
     deps: EmbeddedDeps,
     /// Single fragment for Phase 1 (no partitioning yet).
     fragment: Arc<Fragment>,
+    /// Simplified-HLC clock for LWW timestamps. Each accepted write claims
+    /// `max(prev + 1, wall_time_nanos)`; client-supplied overrides advance
+    /// the clock so a future-dated `TS` never lets a later local write
+    /// silently regress. Phase 5 — `docs/04-replication.md` "Timestamp Source".
+    monotonic_ts: AtomicI64,
 }
 
 impl std::fmt::Debug for EmbeddedDMap {
@@ -146,7 +152,39 @@ impl EmbeddedDMap {
             options,
             deps,
             fragment,
+            monotonic_ts: AtomicI64::new(0),
         })
+    }
+
+    /// Claim the next LWW timestamp:
+    /// `next = max(monotonic_ts + 1, wall_time_nanos)` and store it back.
+    /// CAS loop matches `docs/04-replication.md` simplified-HLC contract: a
+    /// single primary's writes are totally ordered, and a future wall-clock
+    /// jump never decreases the clock.
+    fn next_lww_timestamp(&self) -> i64 {
+        let now = self.now_nanos();
+        loop {
+            let prev = self.monotonic_ts.load(Ordering::Acquire);
+            let candidate = prev.saturating_add(1).max(now);
+            if self
+                .monotonic_ts
+                .compare_exchange_weak(prev, candidate, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return candidate;
+            }
+        }
+    }
+
+    /// Advance the monotonic clock so it tracks `observed`. Used when an
+    /// override `TS` arrives (client-supplied or peer-supplied replication)
+    /// so subsequent default writes keep the strictly-increasing property.
+    fn observe_lww_timestamp(&self, observed: i64) {
+        // `fetch_max` is the perfect primitive here — only advances on a
+        // strictly larger value. Relaxed memory ordering would be fine since
+        // we don't synchronise other memory through this slot, but use
+        // AcqRel to match the CAS loop's ordering for readability.
+        self.monotonic_ts.fetch_max(observed, Ordering::AcqRel);
     }
 
     /// Read-only access to the fragment — the umbrella crate consumes this
@@ -237,7 +275,16 @@ impl EmbeddedDMap {
         }
 
         let ttl_nanos = options.resolve_ttl_nanos(self.deps.clock.as_ref(), self.options.ttl)?;
-        let timestamp = options.timestamp.unwrap_or(now);
+        // Client-supplied TS overrides; otherwise claim a strictly-increasing
+        // monotonic stamp so consecutive writes are totally ordered even when
+        // the wall clock doesn't tick.
+        let timestamp = options.timestamp.map_or_else(
+            || self.next_lww_timestamp(),
+            |ts| {
+                self.observe_lww_timestamp(ts);
+                ts
+            },
+        );
 
         let entry = Entry {
             key: key.as_bytes().to_vec(),
@@ -249,6 +296,38 @@ impl EmbeddedDMap {
         self.fragment.put(hkey, &entry).await?;
         self.evict_if_needed().await;
         Ok(())
+    }
+
+    /// LWW-merge variant used by Phase 5 backup replication.
+    ///
+    /// Unlike [`Self::put_internal`] this:
+    /// - requires `options.timestamp` (primary stamped the write already);
+    /// - bypasses `nx` / `xx` (the primary already enforced these);
+    /// - returns `false` when the existing entry's `timestamp_nanos` already
+    ///   meets-or-exceeds the incoming TS (replication arrived out of order).
+    async fn put_lww_internal(&self, key: &str, value: &[u8], options: PutOptions) -> Result<bool> {
+        options.validate()?;
+        let Some(timestamp) = options.timestamp else {
+            return Err(Error::InvalidArgument(
+                "put_lww requires an explicit timestamp (primary's LWW stamp)".into(),
+            ));
+        };
+        self.observe_lww_timestamp(timestamp);
+        let hkey = self.hkey(key);
+        let now = self.now_nanos();
+        let ttl_nanos = options.resolve_ttl_nanos(self.deps.clock.as_ref(), self.options.ttl)?;
+        let entry = Entry {
+            key: key.as_bytes().to_vec(),
+            ttl_nanos,
+            timestamp_nanos: timestamp,
+            last_access_nanos: now,
+            value: value.to_vec(),
+        };
+        let applied = self.fragment.put_lww(hkey, &entry).await?;
+        if applied {
+            self.evict_if_needed().await;
+        }
+        Ok(applied)
     }
 
     async fn touch_last_access(&self, key: &str, entry: &Entry) {
@@ -315,6 +394,10 @@ impl DMap for EmbeddedDMap {
 
     async fn put(&self, key: &str, value: &[u8], options: PutOptions) -> Result<()> {
         self.put_internal(key, value, options).await
+    }
+
+    async fn put_lww(&self, key: &str, value: &[u8], options: PutOptions) -> Result<bool> {
+        self.put_lww_internal(key, value, options).await
     }
 
     async fn get(&self, key: &str) -> Result<GetResponse> {
@@ -896,5 +979,116 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    // ---------- Phase 5: monotonic LWW timestamp + put_lww ----------
+
+    #[tokio::test]
+    async fn default_put_timestamps_are_strictly_monotonic() {
+        // Two consecutive default-clocked puts must produce strictly
+        // increasing `timestamp_nanos`. Even when the system clock has not
+        // ticked between calls, `max(prev + 1, wall)` guarantees ordering.
+        let d = dmap().await;
+        d.put("k", b"v1", PutOptions::default()).await.unwrap();
+        let r1 = d.get("k").await.unwrap();
+        d.put("k", b"v2", PutOptions::default()).await.unwrap();
+        let r2 = d.get("k").await.unwrap();
+        assert!(
+            r2.timestamp > r1.timestamp,
+            "want monotonic, got {} -> {}",
+            r1.timestamp,
+            r2.timestamp,
+        );
+    }
+
+    #[tokio::test]
+    async fn client_override_ts_does_not_regress_clock() {
+        // After a far-future override TS, the next default-clocked write
+        // must still claim a strictly greater stamp.
+        let d = dmap().await;
+        let far_future = 4_000_000_000_000_000_000_i64; // year ~2096
+        d.put(
+            "k",
+            b"v1",
+            PutOptions {
+                timestamp: Some(far_future),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        d.put("k2", b"v2", PutOptions::default()).await.unwrap();
+        let r = d.get("k2").await.unwrap();
+        assert!(
+            r.timestamp > far_future,
+            "default TS must exceed previous override {far_future}, got {}",
+            r.timestamp,
+        );
+    }
+
+    #[tokio::test]
+    async fn put_lww_requires_explicit_timestamp() {
+        let d = dmap().await;
+        let err = d
+            .put_lww("k", b"v", PutOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn put_lww_applies_newer_ts() {
+        let d = dmap().await;
+        d.put(
+            "k",
+            b"old",
+            PutOptions {
+                timestamp: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let applied = d
+            .put_lww(
+                "k",
+                b"new",
+                PutOptions {
+                    timestamp: Some(200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(applied);
+        assert_eq!(d.get("k").await.unwrap().value, b"new");
+    }
+
+    #[tokio::test]
+    async fn put_lww_rejects_older_ts() {
+        let d = dmap().await;
+        d.put(
+            "k",
+            b"new",
+            PutOptions {
+                timestamp: Some(200),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let applied = d
+            .put_lww(
+                "k",
+                b"old",
+                PutOptions {
+                    timestamp: Some(100),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!applied, "older TS must lose the LWW merge");
+        assert_eq!(d.get("k").await.unwrap().value, b"new");
     }
 }

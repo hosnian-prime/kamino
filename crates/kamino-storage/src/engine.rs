@@ -57,6 +57,25 @@ pub trait StorageEngine: Send + Sync + std::fmt::Debug {
     /// Store an entry, overwriting any prior value for `hkey`.
     async fn put(&mut self, hkey: u64, entry: &Entry) -> Result<()>;
 
+    /// LWW-merge variant of [`Self::put`]. Writes `entry` iff the existing
+    /// entry for `hkey` is absent OR has a strictly smaller
+    /// `timestamp_nanos`. Returns `true` if the new entry was applied,
+    /// `false` if the existing entry won the merge.
+    ///
+    /// Backup replication uses this so out-of-order replication arrivals
+    /// (a later primary write reaching a backup before an earlier one) do
+    /// not overwrite a newer entry. Phase 5 — `docs/04-replication.md`
+    /// "Conflict Resolution: Last-Write-Wins (LWW)".
+    async fn put_lww(&mut self, hkey: u64, entry: &Entry) -> Result<bool> {
+        match self.get(hkey).await? {
+            Some(existing) if existing.timestamp_nanos >= entry.timestamp_nanos => Ok(false),
+            _ => {
+                self.put(hkey, entry).await?;
+                Ok(true)
+            }
+        }
+    }
+
     /// Return the live entry for `hkey`, or `None`. Bumps `last_access`
     /// implicitly is the **caller's** responsibility — the engine does not
     /// mutate metadata on read.

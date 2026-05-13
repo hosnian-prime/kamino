@@ -14,6 +14,7 @@ use kamino_protocol::{Command, Frame};
 
 use crate::handlers::{self, Response};
 use crate::metrics::ServerMetrics;
+use crate::replication::TimestampSource;
 use crate::state::ConnState;
 
 /// Static server-side context shared by all connections.
@@ -34,6 +35,10 @@ pub(crate) struct ServerContext {
     /// Source for `CLUSTER.ROUTINGTABLE`, `CLUSTER.READY`,
     /// `INTERNAL.NODE.UPDATEROUTING`. `None` ⇒ standalone-without-cluster.
     pub(crate) routing_provider: Option<Arc<dyn RoutingProvider>>,
+    /// Node-wide LWW timestamp source. Phase 5 — every write op on the
+    /// primary stamps its entry from here before fan-out, so backups
+    /// receive a single canonical timestamp.
+    pub(crate) ts_source: Arc<TimestampSource>,
 }
 
 impl std::fmt::Debug for ServerContext {
@@ -54,6 +59,7 @@ impl std::fmt::Debug for ServerContext {
 
 const NOAUTH: &str = "NOAUTH Authentication required";
 const NOPERM_INTERNAL: &str = "NOPERM INTERNAL.NODE.* requires cluster_secret auth";
+const QUORUM_NOT_MET: &str = "QUORUM cluster has insufficient members";
 
 pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Command) -> Response {
     ctx.metrics.on_command();
@@ -66,8 +72,21 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
         return Response::ok(Frame::Error(NOPERM_INTERNAL.into()));
     }
 
-    if let Some(moved) = check_routing(ctx, &cmd) {
-        return moved;
+    // Phase 5: `member_count_quorum` is enforced before every DMap op.
+    // Internode forwards bypass the gate because the primary already
+    // checked it; refusing here would break replication during a quorum
+    // dip that the primary already decided to absorb.
+    if !state.internode && is_dmap_op(&cmd) && !ctx_member_quorum_ok(ctx) {
+        return Response::ok(Frame::Error(QUORUM_NOT_MET.into()));
+    }
+
+    // Internode replication arrivals never re-route — the primary already
+    // routed them to us, and re-checking would emit a spurious MOVED back
+    // at the primary.
+    if !state.internode {
+        if let Some(moved) = check_routing(ctx, &cmd) {
+            return moved;
+        }
     }
 
     match cmd {
@@ -95,10 +114,29 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
             key,
             value,
             options,
-        } => handlers::dm_put(&ctx.client, &dmap, &key, &value, options).await,
+        } => {
+            handlers::dm_put(
+                &ctx.client,
+                ctx.routing_provider.as_ref(),
+                ctx.ts_source.as_ref(),
+                state.internode,
+                &dmap,
+                &key,
+                &value,
+                options,
+            )
+            .await
+        }
         Command::DmGet { dmap, key } => handlers::dm_get(&ctx.client, &dmap, &key).await,
         Command::DmDel { dmap, keys } => {
-            handlers::dm_del(&ctx.client, ctx.routing_provider.as_ref(), &dmap, &keys).await
+            handlers::dm_del(
+                &ctx.client,
+                ctx.routing_provider.as_ref(),
+                state.internode,
+                &dmap,
+                &keys,
+            )
+            .await
         }
         Command::DmExpire { dmap, key, seconds } => {
             handlers::dm_expire(&ctx.client, &dmap, &key, Duration::from_secs(seconds)).await
@@ -156,6 +194,31 @@ const fn is_pre_auth_command(cmd: &Command) -> bool {
         cmd,
         Command::Ping(_) | Command::Auth { .. } | Command::Hello(_) | Command::Quit
     )
+}
+
+/// True for any DM.* mutating or read op — used to gate Phase 5
+/// `member_count_quorum` enforcement.
+const fn is_dmap_op(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::DmPut { .. }
+            | Command::DmGet { .. }
+            | Command::DmDel { .. }
+            | Command::DmExpire { .. }
+            | Command::DmPexpire { .. }
+            | Command::DmIncr { .. }
+            | Command::DmDecr { .. }
+            | Command::DmGetPut { .. }
+            | Command::DmIncrByFloat { .. }
+            | Command::DmDestroy { .. }
+            | Command::DmScan { .. }
+    )
+}
+
+fn ctx_member_quorum_ok(ctx: &ServerContext) -> bool {
+    ctx.routing_provider
+        .as_ref()
+        .is_none_or(|p| p.member_quorum_satisfied())
 }
 
 /// `INTERNAL.NODE.*` commands are restricted to peers that authenticated
@@ -224,6 +287,7 @@ mod tests {
             id: 1,
             member_provider: None,
             routing_provider: None,
+            ts_source: Arc::new(TimestampSource::new()),
         }
     }
 
@@ -510,6 +574,7 @@ mod tests {
             id: 1,
             member_provider: None,
             routing_provider: Some(router),
+            ts_source: Arc::new(TimestampSource::new()),
         }
     }
 
@@ -701,5 +766,337 @@ mod tests {
             Frame::Integer(n) => assert_eq!(n, 2),
             other => panic!("expected Integer(2), got {other:?}"),
         }
+    }
+
+    // ---- Phase 5 replication-dispatch tests ----------------------------
+
+    use kamino_cluster::ReplicationSettings;
+    use kamino_core::ReplicationMode;
+    use std::sync::Mutex;
+
+    /// Stub router with full Phase 5 surface — backups list, replication
+    /// settings, member quorum, and a captured forward-command log.
+    #[derive(Debug)]
+    struct ReplStubRouter {
+        /// Returned by `backup_addrs_for_key`.
+        backups: Vec<std::net::SocketAddr>,
+        /// Returned by `member_quorum_satisfied`.
+        quorum_ok: bool,
+        /// Returned by `replication_settings`.
+        settings: ReplicationSettings,
+        /// Captures every forwarded command for assertions.
+        forwarded: Mutex<Vec<(std::net::SocketAddr, Command)>>,
+        /// Reply each forwarded command returns. `None` means simulate a
+        /// transport failure.
+        forward_reply: Option<Frame>,
+    }
+
+    impl ReplStubRouter {
+        fn new(backups: Vec<std::net::SocketAddr>, settings: ReplicationSettings) -> Self {
+            Self {
+                backups,
+                quorum_ok: true,
+                settings,
+                forwarded: Mutex::new(Vec::new()),
+                forward_reply: Some(Frame::ok()),
+            }
+        }
+    }
+
+    impl RoutingProvider for ReplStubRouter {
+        fn routing_table_bytes(&self) -> Option<Vec<u8>> {
+            None
+        }
+        fn apply_routing_update(&self, _bytes: &[u8]) -> Result<ApplyRoutingOutcome, ClusterError> {
+            Ok(ApplyRoutingOutcome::Accepted)
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn routing_signature(&self) -> u64 {
+            1
+        }
+        fn route_key(&self, _dmap_name: &[u8], _key: &[u8]) -> Option<std::net::SocketAddr> {
+            None // local primary for every key
+        }
+        fn partition_for_key(&self, _dmap_name: &[u8], _key: &[u8]) -> u32 {
+            7
+        }
+        fn multi_key_strict(&self) -> bool {
+            false
+        }
+        fn backup_addrs_for_key(
+            &self,
+            _dmap_name: &[u8],
+            _key: &[u8],
+        ) -> Vec<std::net::SocketAddr> {
+            self.backups.clone()
+        }
+        fn member_quorum_satisfied(&self) -> bool {
+            self.quorum_ok
+        }
+        fn replication_settings(&self) -> ReplicationSettings {
+            self.settings
+        }
+        fn forward_command<'a>(
+            &'a self,
+            peer: std::net::SocketAddr,
+            cmd: Command,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Frame, ClusterError>> + Send + 'a>,
+        > {
+            self.forwarded.lock().unwrap().push((peer, cmd));
+            let reply = self.forward_reply.clone();
+            Box::pin(async move {
+                reply.map_or_else(
+                    || {
+                        Err(ClusterError::ServerGone(
+                            "stub forward configured to fail".into(),
+                        ))
+                    },
+                    Ok,
+                )
+            })
+        }
+        fn forward_dm_del<'a>(
+            &'a self,
+            _peer: std::net::SocketAddr,
+            _dmap: bytes::Bytes,
+            keys: Vec<bytes::Bytes>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<i64, ClusterError>> + Send + 'a>,
+        > {
+            let n = i64::try_from(keys.len()).unwrap_or(0);
+            Box::pin(async move { Ok(n) })
+        }
+    }
+
+    fn embedded_ctx_with_router(router: Arc<ReplStubRouter>) -> ServerContext {
+        use kamino_client::embedded::{EmbeddedClient, EmbeddedDeps, EngineFactory};
+        use kamino_core::{Clock, Hasher, SystemClock, XxHasher};
+        use kamino_storage::{Locker, RamBlock, StorageEngine};
+
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let hasher: Arc<dyn Hasher> = Arc::new(XxHasher);
+        let factory: EngineFactory =
+            Arc::new(|| -> Box<dyn StorageEngine> { Box::new(RamBlock::new(4096, 0.4)) });
+        let deps = EmbeddedDeps {
+            clock,
+            hasher,
+            locker: Locker::new(),
+            engine_factory: factory,
+            partition_count: 1,
+        };
+        let embedded: Arc<dyn Client> = EmbeddedClient::new(deps);
+        ServerContext {
+            client: embedded,
+            password: String::new(),
+            cluster_secret: String::new(),
+            metrics: Arc::new(ServerMetrics::new()),
+            version: "0.0.0",
+            id: 1,
+            member_provider: None,
+            routing_provider: Some(router as Arc<dyn RoutingProvider>),
+            ts_source: Arc::new(TimestampSource::new()),
+        }
+    }
+
+    const fn settings_with(replica_count: u32, write_quorum: u32) -> ReplicationSettings {
+        ReplicationSettings {
+            replica_count,
+            write_quorum,
+            read_quorum: 1,
+            read_repair: false,
+            mode: ReplicationMode::Sync,
+        }
+    }
+
+    #[tokio::test]
+    async fn dm_put_fans_out_to_backups_with_assigned_timestamp() {
+        let backup: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let router = Arc::new(ReplStubRouter::new(vec![backup], settings_with(2, 2)));
+        let ctx = embedded_ctx_with_router(Arc::clone(&router));
+        let mut st = ConnState::new(false);
+
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmPut {
+                dmap: Bytes::from_static(b"d"),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                options: kamino_protocol::PutCommandOptions::default(),
+            },
+        )
+        .await;
+        assert!(matches!(resp.frame, Frame::SimpleString(ref s) if s == "OK"));
+
+        let log = router.forwarded.lock().unwrap();
+        assert_eq!(log.len(), 1, "primary must fan out to one backup");
+        match &log[0] {
+            (
+                peer,
+                Command::DmPut {
+                    options, dmap, key, ..
+                },
+            ) => {
+                assert_eq!(*peer, backup);
+                assert_eq!(dmap.as_ref(), b"d");
+                assert_eq!(key.as_ref(), b"k");
+                assert!(
+                    options.timestamp.is_some(),
+                    "primary must stamp replicated writes",
+                );
+            }
+            other => panic!("expected DM.PUT fan-out, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dm_put_returns_quorum_when_backup_acks_missing() {
+        let backup: std::net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let router = Arc::new(ReplStubRouter {
+            backups: vec![backup],
+            forward_reply: None, // simulate transport failure
+            ..ReplStubRouter::new(vec![backup], settings_with(2, 2))
+        });
+        let ctx = embedded_ctx_with_router(Arc::clone(&router));
+        let mut st = ConnState::new(false);
+
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmPut {
+                dmap: Bytes::from_static(b"d"),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                options: kamino_protocol::PutCommandOptions::default(),
+            },
+        )
+        .await;
+        let Frame::Error(msg) = resp.frame else {
+            panic!("expected -QUORUM error frame");
+        };
+        assert!(msg.starts_with("QUORUM"), "got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn dm_put_skips_fanout_in_async_mode_after_local_commit() {
+        // Async mode: primary returns OK without waiting for backups. The
+        // tokio task fires-and-forgets; assertions focus on the immediate
+        // reply, not the eventual log state.
+        let backup: std::net::SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let mut settings = settings_with(2, 2);
+        settings.mode = ReplicationMode::Async;
+        let router = Arc::new(ReplStubRouter::new(vec![backup], settings));
+        let ctx = embedded_ctx_with_router(Arc::clone(&router));
+        let mut st = ConnState::new(false);
+
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmPut {
+                dmap: Bytes::from_static(b"d"),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                options: kamino_protocol::PutCommandOptions::default(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp.frame, Frame::SimpleString(ref s) if s == "OK"),
+            "async mode must return OK before fan-out completes",
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_put_replica_arrival_takes_lww_path_and_skips_fanout() {
+        // A peer-authenticated connection delivering a DM.PUT (state.internode
+        // = true) must apply LWW merge and NOT fan back out.
+        let backup: std::net::SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        let router = Arc::new(ReplStubRouter::new(vec![backup], settings_with(2, 2)));
+        let ctx = embedded_ctx_with_router(Arc::clone(&router));
+        let mut st = ConnState::new(false);
+        st.internode = true;
+
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmPut {
+                dmap: Bytes::from_static(b"d"),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                options: kamino_protocol::PutCommandOptions {
+                    timestamp: Some(123_456),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+        assert!(matches!(resp.frame, Frame::SimpleString(ref s) if s == "OK"));
+        assert!(
+            router.forwarded.lock().unwrap().is_empty(),
+            "backup must not re-fan-out replicated writes",
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_put_quorum_unmet_rejects() {
+        // member_count_quorum gate: when the cluster has too few live
+        // members, every DM.* op short-circuits with -QUORUM.
+        let mut router_inner = ReplStubRouter::new(vec![], settings_with(1, 1));
+        router_inner.quorum_ok = false;
+        let router = Arc::new(router_inner);
+        let ctx = embedded_ctx_with_router(Arc::clone(&router));
+        let mut st = ConnState::new(false);
+
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmPut {
+                dmap: Bytes::from_static(b"d"),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                options: kamino_protocol::PutCommandOptions::default(),
+            },
+        )
+        .await;
+        let Frame::Error(msg) = resp.frame else {
+            panic!("expected -QUORUM");
+        };
+        assert!(msg.starts_with("QUORUM"), "got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn dm_put_replica_arrival_bypasses_quorum_gate() {
+        // The primary already decided to accept the write; the backup must
+        // mirror that decision even if its own live-member view is below
+        // member_count_quorum (transient SWIM dip).
+        let mut router_inner = ReplStubRouter::new(vec![], settings_with(2, 2));
+        router_inner.quorum_ok = false;
+        let router = Arc::new(router_inner);
+        let ctx = embedded_ctx_with_router(Arc::clone(&router));
+        let mut st = ConnState::new(false);
+        st.internode = true;
+
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmPut {
+                dmap: Bytes::from_static(b"d"),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                options: kamino_protocol::PutCommandOptions {
+                    timestamp: Some(42),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp.frame, Frame::SimpleString(ref s) if s == "OK"),
+            "internode write must bypass quorum gate, got {:?}",
+            resp.frame,
+        );
     }
 }

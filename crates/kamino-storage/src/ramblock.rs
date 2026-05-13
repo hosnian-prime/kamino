@@ -444,6 +444,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_lww_rejects_older_timestamp() {
+        // Phase 5 — backup-side replication relies on LWW so out-of-order
+        // arrivals can't overwrite a fresher entry.
+        let mut rb = RamBlock::new(4096, 0.4);
+        rb.put(1, &entry(b"k", b"newer", 10)).await.unwrap();
+        let applied = rb.put_lww(1, &entry(b"k", b"older", 5)).await.unwrap();
+        assert!(!applied, "older timestamp must lose the merge");
+        assert_eq!(rb.get(1).await.unwrap().unwrap().value, b"newer");
+    }
+
+    #[tokio::test]
+    async fn put_lww_applies_newer_timestamp() {
+        let mut rb = RamBlock::new(4096, 0.4);
+        rb.put(1, &entry(b"k", b"older", 5)).await.unwrap();
+        let applied = rb.put_lww(1, &entry(b"k", b"newer", 10)).await.unwrap();
+        assert!(applied, "newer timestamp must apply");
+        assert_eq!(rb.get(1).await.unwrap().unwrap().value, b"newer");
+    }
+
+    #[tokio::test]
+    async fn put_lww_writes_when_absent() {
+        let mut rb = RamBlock::new(4096, 0.4);
+        let applied = rb.put_lww(7, &entry(b"k", b"v", 1)).await.unwrap();
+        assert!(applied, "first insert always applies");
+        assert_eq!(rb.get(7).await.unwrap().unwrap().value, b"v");
+    }
+
+    #[tokio::test]
+    async fn put_lww_equal_timestamp_existing_wins() {
+        // Equal timestamps: existing entry wins (deterministic — primary's
+        // monotonic clock guarantees strict-monotonicity per partition, so a
+        // tie can only happen across primaries during split-brain; tie-break
+        // by "first writer keeps" matches existing import() semantics).
+        let mut rb = RamBlock::new(4096, 0.4);
+        rb.put(1, &entry(b"k", b"first", 10)).await.unwrap();
+        let applied = rb.put_lww(1, &entry(b"k", b"second", 10)).await.unwrap();
+        assert!(!applied);
+        assert_eq!(rb.get(1).await.unwrap().unwrap().value, b"first");
+    }
+
+    #[tokio::test]
     async fn import_rejects_unknown_format() {
         let mut rb = RamBlock::new(4096, 0.4);
         let bad = vec![0xff, 0, 0, 0, 0];
