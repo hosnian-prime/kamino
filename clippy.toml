@@ -1,0 +1,14 @@
+# Allow async fn return types in public API (we ship public async traits).
+avoid-breaking-exported-api = false
+
+# Cognitive complexity threshold (default 25 is too aggressive for state machines).
+cognitive-complexity-threshold = 40
+
+# Type complexity for routing-table / config structs.
+type-complexity-threshold = 250
+
+# Conservative enum size threshold (Error enums get large).
+enum-variant-size-threshold = 256
+
+# Maximum number of lines for a single function before pedantic complains.
+too-many-lines-threshold = 200

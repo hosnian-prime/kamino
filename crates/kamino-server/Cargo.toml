@@ -1,0 +1,28 @@
+[package]
+name = "kamino-server"
+description = "TCP listener, RESP dispatch and SIGHUP reload for the Kamino server binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kamino-server"
+path = "src/bin/kamino-server.rs"
+
+[dependencies]
+kamino-core = { workspace = true }
+kamino-protocol = { workspace = true }
+kamino-cluster = { workspace = true }
+kamino-observability = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+bytes = { workspace = true }
