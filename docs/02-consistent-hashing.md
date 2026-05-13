@@ -25,7 +25,21 @@ Kamino uses a two-level scheme adapted from the paper: (1) members are placed on
 - Prime number for better hash distribution
 - Small enough for low overhead in routing table
 - Large enough for reasonable distribution across typical cluster sizes (3-50 nodes)
-- Configurable for larger deployments
+- Configurable for larger deployments **at bootstrap only** (see immutability note below)
+
+### Immutability of `partition_count`
+
+**`partition_count` is fixed for the lifetime of a cluster.** Once any key has been written, the value cannot be changed without remapping every key.
+
+The key-to-partition formula is `partition_id = hash(dmap_name + key) % partition_count`. Change the divisor and almost every key maps to a different partition. The routing table picks up the new value immediately, but data already sitting in the storage engine was placed by the old value — every `GET` becomes a miss against fresh-looking primaries, and the balancer cannot migrate orphaned fragments because nothing records which old partition they belonged to.
+
+Pick the partition count at cluster bootstrap and commit to it:
+
+- 271 (default) covers 3–50 nodes comfortably.
+- Use a larger prime (509, 1021, 2053, …) for clusters expected to grow into the hundreds of nodes.
+- Routing-table memory grows as `O(partition_count × replica_count × member_size)` — modest, but you cannot grow it later.
+
+The only safe path to change `partition_count` after launch is a full cluster rebuild: stand up a fresh cluster with the new value, backfill or dual-write from the old, then cut over. This constraint is inherited from the partition-mod-N design and is shared by Hazelcast and Olric.
 
 ## Hash Function
 

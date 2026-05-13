@@ -14,8 +14,9 @@ Kamino uses TOML for configuration:
 
 ```toml
 [core]
-# Total number of hash ring partitions (should be prime)
-# Higher values = better distribution, more memory overhead
+# Total number of hash ring partitions (should be prime).
+# IMMUTABLE after first write — changing this value invalidates every existing key.
+# Pick once at bootstrap. See docs/02-consistent-hashing.md#immutability-of-partition_count.
 partition_count = 271
 
 # Number of data replicas (1 = primary only, 2 = primary + 1 backup)

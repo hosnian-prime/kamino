@@ -88,3 +88,5 @@ Kamino is a **primary-routed, eventually consistent** distributed cache:
 | [Pub/Sub](11-pubsub.md) | Publish/subscribe system |
 | [Failure Handling](12-failure-handling.md) | Partition recovery, split-brain, anti-entropy |
 | [Kubernetes](13-kubernetes.md) | StatefulSet, headless Service, DNS-based discovery |
+| [Observability](14-observability.md) | Prometheus metrics, OpenTelemetry tracing, slow command log |
+| [Compatibility](15-compatibility.md) | Wire versioning, MessagePack schema evolution, rolling upgrade procedure |

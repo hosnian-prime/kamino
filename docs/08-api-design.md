@@ -51,7 +51,13 @@ pub trait DMap: Send + Sync {
     /// Retrieve a value by key
     async fn get(&self, key: &str) -> Result<GetResponse>;
 
-    /// Delete one or more keys, returns count of deleted keys
+    /// Delete one or more keys, returns count of successfully deleted live keys.
+    ///
+    /// Keys that hash to different partitions are fanned out server-side and executed
+    /// in parallel against their respective primaries. The operation is **not atomic
+    /// across partitions**: on partial failure the count reflects successful deletes
+    /// only, and the first error is returned alongside.
+    /// See [Multi-Key Operations](06-network-protocol.md#multi-key-operations).
     async fn delete(&self, keys: &[&str]) -> Result<usize>;
 
     /// Increment an integer value, serialized at the partition primary.
@@ -253,7 +259,14 @@ impl Pipeline {
     /// Add a DELETE operation
     pub fn delete(&mut self, key: &str) -> &mut Self;
 
-    /// Execute all operations, returns results in order
+    /// Execute all operations, returns results in input order.
+    ///
+    /// Operations targeting the same partition primary are sent on the same pipelined
+    /// connection and serialize in input order on that primary. Operations targeting
+    /// different primaries run in parallel up to `concurrency`. There is **no global
+    /// ordering across partitions** — a `put` followed by a `get` on the same key
+    /// observes the put, but ordering between unrelated keys on different primaries
+    /// is unspecified.
     pub async fn execute(&self) -> Vec<Result<PipelineResult>>;
 }
 ```
