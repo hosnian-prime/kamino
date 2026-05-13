@@ -49,7 +49,7 @@ On Kubernetes, point it at a headless Service and it figures out the topology fr
 
 ## Docs
 
-Technical documentation is in [`docs/`](docs/00-overview.md).
+Technical documentation is in [`docs/`](docs/00-overview.md). The implementation plan is in [`ROADMAP.md`](ROADMAP.md).
 
 ## Status
 
