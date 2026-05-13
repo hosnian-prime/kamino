@@ -511,9 +511,7 @@ pub trait RoutingProvider: Send + Sync {
         peer: SocketAddr,
         dmap: bytes::Bytes,
         keys: Vec<bytes::Bytes>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<i64, ClusterError>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, ClusterError>> + Send + 'a>>;
 }
 
 impl RoutingProvider for Cluster {
@@ -568,9 +566,8 @@ impl RoutingProvider for Cluster {
         peer: SocketAddr,
         dmap: bytes::Bytes,
         keys: Vec<bytes::Bytes>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<i64, ClusterError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, ClusterError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let Some(fwd) = self.forwarder.clone() else {
                 return Err(ClusterError::ServerGone(format!(
@@ -586,7 +583,10 @@ impl RoutingProvider for Cluster {
                     // the error tail rides our own ServerGone for now.
                     let mut parts = s.splitn(3, ' ');
                     let _ = parts.next();
-                    let count = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    let count = parts
+                        .next()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
                     let rest = parts.next().unwrap_or("").to_string();
                     Err(ClusterError::ServerGone(format!(
                         "downstream partial: count={count}, err={rest}",

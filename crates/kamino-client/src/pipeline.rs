@@ -143,11 +143,7 @@ impl Pipeline {
     /// per-primary ordering guarantee.
     pub async fn execute(self) -> Vec<Result<PipelineResult>> {
         use futures::stream::{self, StreamExt as _};
-        let Self {
-            dmap,
-            options,
-            ops,
-        } = self;
+        let Self { dmap, options, ops } = self;
         let concurrency = options.concurrency.max(1);
         let dmap = Arc::clone(&dmap);
         stream::iter(ops.into_iter().map(move |op| {
@@ -201,7 +197,10 @@ mod tests {
         }
         async fn put(&self, key: &str, value: &[u8], _options: PutOptions) -> Result<()> {
             self.log.lock().unwrap().push(format!("PUT {key}"));
-            self.store.lock().unwrap().insert(key.into(), value.to_vec());
+            self.store
+                .lock()
+                .unwrap()
+                .insert(key.into(), value.to_vec());
             Ok(())
         }
         async fn get(&self, key: &str) -> Result<GetResponse> {
@@ -282,9 +281,6 @@ mod tests {
         assert!(matches!(results[4], Err(Error::KeyNotFound)));
 
         let log = dmap.log.lock().unwrap().clone();
-        assert_eq!(
-            log,
-            vec!["PUT a", "PUT b", "GET a", "DEL b", "GET b",]
-        );
+        assert_eq!(log, vec!["PUT a", "PUT b", "GET a", "DEL b", "GET b",]);
     }
 }

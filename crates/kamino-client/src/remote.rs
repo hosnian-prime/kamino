@@ -692,7 +692,10 @@ fn check_not_error(frame: &Frame) -> Result<()> {
 fn translate_error(msg: &str) -> Error {
     if let Some(rest) = msg.strip_prefix("MOVED ") {
         let mut parts = rest.splitn(2, ' ');
-        let partition = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let partition = parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
         let addr = parts.next().unwrap_or("").to_string();
         return Error::Moved { partition, addr };
     }

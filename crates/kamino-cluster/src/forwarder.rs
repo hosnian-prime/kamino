@@ -139,7 +139,9 @@ impl Forwarder {
     /// recycles the local routing table; this is the immediate hop.
     async fn send_with_retry(&self, peer: SocketAddr, cmd: Command) -> ClusterResult<Frame> {
         let pool = self.get_or_create_pool(peer);
-        let first = pool.send(cmd.clone(), self.inner.config.request_timeout).await;
+        let first = pool
+            .send(cmd.clone(), self.inner.config.request_timeout)
+            .await;
         match first {
             Err(ClusterError::Moved(msg)) => {
                 // `<partition> <host:port>`
@@ -241,7 +243,9 @@ impl PeerPool {
     fn record_dial_failure(&self) -> Duration {
         let mut cur = self.backoff_current.lock();
         let now = *cur;
-        let doubled = now.checked_mul(2).unwrap_or(self.config.reconnect_backoff_max);
+        let doubled = now
+            .checked_mul(2)
+            .unwrap_or(self.config.reconnect_backoff_max);
         *cur = doubled.min(self.config.reconnect_backoff_max);
         now
     }
@@ -258,7 +262,10 @@ impl PeerPool {
     #[allow(clippy::option_if_let_else)]
     async fn send(&self, cmd: Command, request_timeout: Duration) -> ClusterResult<Frame> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(ClusterError::ServerGone(format!("peer {} evicted", self.addr)));
+            return Err(ClusterError::ServerGone(format!(
+                "peer {} evicted",
+                self.addr
+            )));
         }
         let conn = self.pick_conn().await?;
         let outcome = timeout(request_timeout, conn.send_request(cmd)).await;
@@ -359,7 +366,11 @@ struct PoolConn {
     reader_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-type OutgoingCommand = (Command, oneshot::Sender<ClusterResult<Frame>>, OwnedSemaphorePermit);
+type OutgoingCommand = (
+    Command,
+    oneshot::Sender<ClusterResult<Frame>>,
+    OwnedSemaphorePermit,
+);
 
 impl PoolConn {
     async fn start<S>(
@@ -372,12 +383,12 @@ impl PoolConn {
     {
         let codec = RespCodec::new();
         let framed = Framed::new(stream, codec);
-        let permits = Arc::new(Semaphore::new(usize::try_from(
-            config.inflight_per_conn.max(1),
-        ).unwrap_or(1)));
-        let (cmd_tx, cmd_rx) = mpsc::channel::<OutgoingCommand>(usize::try_from(
-            config.inflight_per_conn.max(1),
-        ).unwrap_or(1));
+        let permits = Arc::new(Semaphore::new(
+            usize::try_from(config.inflight_per_conn.max(1)).unwrap_or(1),
+        ));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<OutgoingCommand>(
+            usize::try_from(config.inflight_per_conn.max(1)).unwrap_or(1),
+        );
         let in_flight: Arc<Mutex<VecDeque<InFlight>>> = Arc::new(Mutex::new(VecDeque::new()));
         let terminal = Arc::new(AtomicBool::new(false));
         let notify_terminal = Arc::new(Notify::new());
@@ -485,7 +496,10 @@ async fn handshake_inner(conn: &PoolConn, cluster_secret: &str) -> ClusterResult
         auth: if cluster_secret.is_empty() {
             None
         } else {
-            Some((None, bytes::Bytes::copy_from_slice(cluster_secret.as_bytes())))
+            Some((
+                None,
+                bytes::Bytes::copy_from_slice(cluster_secret.as_bytes()),
+            ))
         },
         client_name: Some(bytes::Bytes::from_static(b"kamino-internode")),
     };
@@ -554,7 +568,9 @@ where
     fn fail_all(&self, reason: &str) {
         let mut q = self.in_flight.lock();
         while let Some(slot) = q.pop_front() {
-            let _ = slot.reply.send(Err(ClusterError::ServerGone(reason.to_string())));
+            let _ = slot
+                .reply
+                .send(Err(ClusterError::ServerGone(reason.to_string())));
         }
     }
 }
@@ -603,7 +619,9 @@ where
     fn fail_all(&self, reason: &str) {
         let mut q = self.in_flight.lock();
         while let Some(slot) = q.pop_front() {
-            let _ = slot.reply.send(Err(ClusterError::ServerGone(reason.to_string())));
+            let _ = slot
+                .reply
+                .send(Err(ClusterError::ServerGone(reason.to_string())));
         }
     }
 }
@@ -772,7 +790,9 @@ mod tests {
     #[tokio::test]
     async fn forward_returns_pong() {
         let seen = Arc::new(AtomicUsize::new(0));
-        let server = Arc::new(PingEcho { seen: Arc::clone(&seen) });
+        let server = Arc::new(PingEcho {
+            seen: Arc::clone(&seen),
+        });
         let connector = Arc::new(LocalConnector { server });
         let fwd = Forwarder::with_connector(
             ForwarderConfig {
@@ -959,6 +979,134 @@ mod tests {
         assert_eq!(pool.record_dial_failure(), Duration::from_millis(80));
         pool.record_dial_success();
         assert_eq!(pool.record_dial_failure(), Duration::from_millis(10));
+    }
+
+    /// ROADMAP §6 Phase 4 acceptance #4 + Risks: forwarder backpressure
+    /// engages when a peer is slow; the per-connection inflight cap is
+    /// honoured and never exceeded, which is the memory-ceiling guarantee.
+    ///
+    /// Setup:
+    /// - `inflight_per_conn = 4`, `pool_size = 1` → server can see at most
+    ///   4 in-flight commands at any instant.
+    /// - Server replies on a 30ms delay so requests pile up against the
+    ///   semaphore.
+    /// - Fire 16 concurrent forwards. Track the live in-flight count on
+    ///   the server side via an atomic; assert it never exceeds the cap.
+    #[tokio::test(start_paused = false)]
+    async fn backpressure_caps_inflight_under_slow_peer() {
+        use std::sync::atomic::AtomicU32;
+
+        // Server that reads requests as fast as the wire delivers them but
+        // delays each reply on a spawned task. This lets multiple commands
+        // be "in-flight on the server side" simultaneously — exactly what
+        // the client-side per-connection semaphore needs to push back on.
+        // Each accepted PING is counted; the peak is the max simultaneous
+        // count, which must stay <= inflight_per_conn.
+        #[derive(Debug)]
+        struct SlowEcho {
+            inflight: Arc<AtomicU32>,
+            peak: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl LocalServer for SlowEcho {
+            async fn handle(&self, server_end: TokioDuplex) {
+                let codec = RespCodec::new();
+                let framed = Framed::new(server_end, codec);
+                let (mut sink, mut stream) = framed.split();
+                // Serialise replies onto the sink via a channel so spawned
+                // delayed tasks can hand back frames in completion order.
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(64);
+                let writer = tokio::spawn(async move {
+                    while let Some(frame) = rx.recv().await {
+                        if sink.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                while let Some(item) = stream.next().await {
+                    let Ok(frame) = item else {
+                        break;
+                    };
+                    let Ok(cmd) = Command::parse(frame) else {
+                        let _ = tx.send(Frame::Error("ERR parse".into())).await;
+                        continue;
+                    };
+                    match cmd {
+                        Command::Hello(_) => {
+                            let _ = tx
+                                .send(Frame::Array(Some(vec![Frame::Bulk(BulkString::from(
+                                    "server",
+                                ))])))
+                                .await;
+                        }
+                        Command::Ping(_) => {
+                            let live = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                            self.peak.fetch_max(live, Ordering::SeqCst);
+                            let inflight = Arc::clone(&self.inflight);
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(60)).await;
+                                inflight.fetch_sub(1, Ordering::SeqCst);
+                                let _ = tx.send(Frame::SimpleString("PONG".into())).await;
+                            });
+                        }
+                        _ => {
+                            let _ = tx.send(Frame::Error("ERR unexpected".into())).await;
+                        }
+                    }
+                }
+                drop(tx);
+                let _ = writer.await;
+            }
+        }
+
+        const CAP: u32 = 4;
+        let inflight = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let connector = Arc::new(LocalConnector {
+            server: Arc::new(SlowEcho {
+                inflight: Arc::clone(&inflight),
+                peak: Arc::clone(&peak),
+            }),
+        });
+        let fwd = Forwarder::with_connector(
+            ForwarderConfig {
+                pool_size: 1,
+                inflight_per_conn: CAP,
+                connect_timeout: Duration::from_secs(5),
+                request_timeout: Duration::from_secs(5),
+                reconnect_backoff_min: Duration::from_millis(10),
+                reconnect_backoff_max: Duration::from_millis(100),
+                cluster_secret: String::new(),
+            },
+            connector,
+        );
+
+        // Fire 16 concurrent forwards.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let fwd = fwd.clone();
+            handles.push(tokio::spawn(async move {
+                fwd.send(local_addr(), Command::Ping(None)).await
+            }));
+        }
+        let results = futures::future::join_all(handles).await;
+        for r in results {
+            let reply = r.expect("join").expect("forward");
+            assert!(matches!(reply, Frame::SimpleString(ref s) if s == "PONG"));
+        }
+
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            observed_peak <= CAP,
+            "peak in-flight {observed_peak} exceeded cap {CAP} — backpressure failed",
+        );
+        // Lower bound: at least one batch fully saturated the cap, otherwise
+        // we aren't actually exercising the queue.
+        assert!(
+            observed_peak >= 2,
+            "peak in-flight too low ({observed_peak}); test fixture didn't fan out",
+        );
     }
 
     #[tokio::test]

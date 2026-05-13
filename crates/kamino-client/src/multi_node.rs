@@ -77,7 +77,10 @@ impl MultiNodeRemoteClient {
         }
         let client = RemoteClient::connect(addr, self.inner.auth.as_deref()).await?;
         let arc = Arc::new(client);
-        self.inner.pool.lock().insert(addr.to_string(), Arc::clone(&arc));
+        self.inner
+            .pool
+            .lock()
+            .insert(addr.to_string(), Arc::clone(&arc));
         Ok(arc)
     }
 

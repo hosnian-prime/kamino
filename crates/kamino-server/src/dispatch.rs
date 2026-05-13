@@ -468,10 +468,7 @@ mod tests {
         fn routing_table_bytes(&self) -> Option<Vec<u8>> {
             None
         }
-        fn apply_routing_update(
-            &self,
-            _bytes: &[u8],
-        ) -> Result<ApplyRoutingOutcome, ClusterError> {
+        fn apply_routing_update(&self, _bytes: &[u8]) -> Result<ApplyRoutingOutcome, ClusterError> {
             Ok(ApplyRoutingOutcome::Accepted)
         }
         fn is_ready(&self) -> bool {
@@ -480,11 +477,7 @@ mod tests {
         fn routing_signature(&self) -> u64 {
             1
         }
-        fn route_key(
-            &self,
-            _dmap_name: &[u8],
-            _key: &[u8],
-        ) -> Option<std::net::SocketAddr> {
+        fn route_key(&self, _dmap_name: &[u8], _key: &[u8]) -> Option<std::net::SocketAddr> {
             self.forced
         }
         fn partition_for_key(&self, _dmap_name: &[u8], _key: &[u8]) -> u32 {
@@ -499,11 +492,7 @@ mod tests {
             _dmap: bytes::Bytes,
             keys: Vec<bytes::Bytes>,
         ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<i64, ClusterError>>
-                    + Send
-                    + 'a,
-            >,
+            Box<dyn std::future::Future<Output = Result<i64, ClusterError>> + Send + 'a>,
         > {
             // Stub: pretend every forwarded key was deleted successfully.
             let n = i64::try_from(keys.len()).unwrap_or(0);
@@ -545,10 +534,7 @@ mod tests {
         let Frame::Error(msg) = resp.frame else {
             panic!("expected -MOVED error frame");
         };
-        assert!(
-            msg.starts_with("MOVED 7 127.0.0.1:9999"),
-            "got {msg:?}",
-        );
+        assert!(msg.starts_with("MOVED 7 127.0.0.1:9999"), "got {msg:?}",);
     }
 
     #[tokio::test]
@@ -682,10 +668,9 @@ mod tests {
         // key assertion is the *absence* of NOPERM — i.e. the cluster-
         // secret gate let us through.
         match resp.frame {
-            Frame::Error(ref m) => assert!(
-                !m.starts_with("NOPERM"),
-                "expected non-NOPERM, got {m:?}",
-            ),
+            Frame::Error(ref m) => {
+                assert!(!m.starts_with("NOPERM"), "expected non-NOPERM, got {m:?}");
+            }
             Frame::SimpleString(_) => {} // accepted
             other => panic!("unexpected reply: {other:?}"),
         }
