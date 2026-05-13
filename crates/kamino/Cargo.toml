@@ -39,3 +39,8 @@ kamino-client = { workspace = true }
 kamino-storage = { workspace = true }
 kamino-core = { workspace = true }
 regex = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "embedded"
+harness = false
