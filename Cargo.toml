@@ -79,6 +79,7 @@ winnow = "0.6"
 
 # Storage helpers
 roaring = "0.10"
+regex = "1.10"
 
 # Logging detail / IDs
 rand = "0.8"

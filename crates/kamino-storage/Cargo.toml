@@ -20,3 +20,10 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 roaring = { workspace = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
+regex = "1.10"
+
+[dev-dependencies]
+proptest = { workspace = true }
+assert_matches = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
