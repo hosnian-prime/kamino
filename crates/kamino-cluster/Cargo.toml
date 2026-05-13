@@ -24,6 +24,7 @@ kamino-storage = { workspace = true }
 kamino-protocol = { workspace = true }
 kamino-observability = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
@@ -32,3 +33,9 @@ serde = { workspace = true }
 rmp-serde = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync"] }
+turmoil = { workspace = true }
+proptest = { workspace = true }
+assert_matches = { workspace = true }

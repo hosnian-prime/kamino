@@ -113,6 +113,7 @@ impl Server {
             metrics: Arc::new(ServerMetrics::new()),
             version: env!("CARGO_PKG_VERSION"),
             id,
+            member_provider: None,
         });
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let settings = ConnSettings {

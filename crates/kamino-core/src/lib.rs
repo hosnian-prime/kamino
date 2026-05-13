@@ -26,6 +26,7 @@ pub mod config;
 pub mod error;
 pub mod hasher;
 pub mod ids;
+pub mod member;
 pub mod mode;
 pub mod profile;
 pub mod tracing_init;
@@ -39,5 +40,6 @@ pub use config::{
 pub use error::{Error, Result};
 pub use hasher::{Hasher, XxHasher};
 pub use ids::MemberId;
+pub use member::Member;
 pub use mode::Mode;
 pub use profile::Profile;

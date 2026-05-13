@@ -161,6 +161,30 @@ fn build_hello_response(version: &str, resp3: bool, server_id: u64) -> Frame {
     }
 }
 
+pub(crate) fn cluster_members(
+    provider: Option<&Arc<dyn kamino_cluster::MemberProvider>>,
+) -> Response {
+    // Encoding (one inner array per member):
+    //   [id_hex, name, addr, discovery_addr, birthdate_ns_str, is_coordinator]
+    //
+    // RESP2 lacks a boolean type; `is_coordinator` is encoded as the string
+    // "1" or "0" so RESP2 clients can parse it without HELLO 3.
+    let members = provider.map(|p| p.members()).unwrap_or_default();
+    let mut outer = Vec::with_capacity(members.len());
+    for m in members {
+        let row = vec![
+            Frame::Bulk(BulkString::from(m.id.to_string().as_str())),
+            Frame::Bulk(BulkString::from(m.name.as_str())),
+            Frame::Bulk(BulkString::from(m.addr.to_string().as_str())),
+            Frame::Bulk(BulkString::from(m.discovery_addr.to_string().as_str())),
+            Frame::Bulk(BulkString::from(m.birthdate.to_string().as_str())),
+            Frame::Bulk(BulkString::from(if m.is_coordinator { "1" } else { "0" })),
+        ];
+        outer.push(Frame::Array(Some(row)));
+    }
+    Response::ok(Frame::Array(Some(outer)))
+}
+
 pub(crate) fn stats(snap: crate::metrics::MetricsSnapshot, server_version: &str) -> Response {
     let pairs: [(&str, String); 5] = [
         ("uptime_secs", snap.uptime_secs.to_string()),
