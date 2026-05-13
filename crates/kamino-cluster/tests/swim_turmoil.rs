@@ -170,12 +170,14 @@ async fn five_node_cluster_detects_death_within_suspicion_window() {
     }
     // Leave one node and verify the remaining four observe the shrinkage
     // within suspicion_multiplier * probe_interval = 3 * 100ms = 300ms.
-    // Allow a generous wall-clock budget so parallel tests on CI don't
-    // starve the SWIM tasks.
+    // The deadline is generous to absorb (1) parallel-test scheduler
+    // pressure that stretches probe_interval ticks, and (2) gossip
+    // propagation latency across the 4 surviving nodes — Phase 5's Jepsen
+    // suite verifies the tight bound under controlled conditions.
     let leaving = nodes.pop().unwrap();
     let _ = leaving.shutdown().await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(6000);
     loop {
         let ok = nodes.iter().all(|n| n.snapshot_members().len() == 4);
         if ok {

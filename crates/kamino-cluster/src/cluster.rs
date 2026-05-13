@@ -104,9 +104,12 @@ impl Cluster {
     /// before their peers don't fail to start. Single-node deployments (no
     /// peers configured **and** discovery returns nothing) succeed silently.
     pub async fn bootstrap(deps: ClusterDeps) -> ClusterResult<Arc<Self>> {
-        // Run init on the discovery plugin once (idempotent for the static
-        // and DNS plugins; matters for K8s/Consul in later phases).
+        // Run init + register on the discovery plugin once (idempotent for
+        // the static and DNS plugins; matters for K8s/Consul in later
+        // phases). `register` advertises this node in the external
+        // discovery registry; `shutdown` calls `deregister` on the way out.
         deps.discovery.init().await?;
+        deps.discovery.register().await?;
 
         let swim_config = deps.config.swim.clone();
         let discovery_config = deps.config.discovery.clone();
@@ -299,6 +302,9 @@ impl Cluster {
         for task in handles {
             let _ = task.await;
         }
+        // Deregister from the external discovery system before shutting
+        // down plugin-owned resources (Consul / K8s / cloud APIs).
+        let _ = self.discovery.deregister().await;
         let _ = self.discovery.shutdown().await;
         Ok(())
     }

@@ -21,11 +21,35 @@ mod dns;
 pub use dns::DnsDiscovery;
 
 /// Pluggable peer discovery.
+///
+/// Lifecycle (per `docs/03-cluster-management.md` "Node Discovery"):
+///
+/// ```text
+/// init   → register → (discover loop) → deregister → shutdown
+/// ```
+///
+/// `init` is called once after construction; for plugins that need to set
+/// up sockets / clients this is where it happens. `register` advertises the
+/// local node in an external registry (Consul, Kubernetes Endpoints, …) —
+/// static and DNS plugins implement it as a no-op. `discover` is called per
+/// join attempt. `deregister` undoes `register` on graceful leave;
+/// `shutdown` releases plugin-owned resources.
 #[async_trait]
 pub trait DiscoveryPlugin: Send + Sync {
-    /// Initialise. Called once after construction; may register the local
-    /// node in an external system.
+    /// Initialise the plugin. Called once after construction.
     async fn init(&self) -> ClusterResult<()> {
+        Ok(())
+    }
+
+    /// Register this node in the external discovery system. No-op for static
+    /// and DNS plugins; meaningful for Consul / Kubernetes / cloud APIs.
+    async fn register(&self) -> ClusterResult<()> {
+        Ok(())
+    }
+
+    /// Deregister this node from the external discovery system. Called from
+    /// `Cluster::shutdown` before the SWIM tasks are cancelled.
+    async fn deregister(&self) -> ClusterResult<()> {
         Ok(())
     }
 
@@ -33,7 +57,7 @@ pub trait DiscoveryPlugin: Send + Sync {
     /// attempt — implementations should treat this as a fresh lookup.
     async fn discover(&self) -> ClusterResult<Vec<SocketAddr>>;
 
-    /// Deregister and tear down. Called during graceful leave.
+    /// Tear down plugin-owned resources (HTTP clients, watchers, ...).
     async fn shutdown(&self) -> ClusterResult<()> {
         Ok(())
     }
