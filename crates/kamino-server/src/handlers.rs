@@ -357,27 +357,84 @@ pub(crate) async fn dm_get(client: &Arc<dyn Client>, dmap: &Bytes, key: &Bytes) 
     }
 }
 
-pub(crate) async fn dm_del(client: &Arc<dyn Client>, dmap: &Bytes, keys: &[Bytes]) -> Response {
+pub(crate) async fn dm_del(
+    client: &Arc<dyn Client>,
+    routing: Option<&Arc<dyn kamino_cluster::RoutingProvider>>,
+    dmap: &Bytes,
+    keys: &[Bytes],
+) -> Response {
     if keys.is_empty() {
         return Response::ok(Frame::Integer(0));
     }
-    let d = match dmap_handle(client, dmap).await {
-        Ok(d) => d,
-        Err(f) => return Response::ok(f),
+
+    // Standalone (no routing): local delete only.
+    let Some(routing) = routing else {
+        return dm_del_local(client, dmap, keys).await;
     };
+
+    // Bucket keys by primary owner. `None` = local; `Some(addr)` = remote.
+    let mut buckets: std::collections::HashMap<Option<std::net::SocketAddr>, Vec<Bytes>> =
+        std::collections::HashMap::new();
+    for key in keys {
+        let owner = routing.route_key(dmap, key);
+        buckets.entry(owner).or_default().push(key.clone());
+    }
+
+    let crossed_partitions = buckets.len() > 1
+        || (buckets.len() == 1 && buckets.keys().next().is_some_and(Option::is_some));
+    if crossed_partitions && routing.multi_key_strict() {
+        return Response::ok(Frame::Error(
+            "CROSSPARTITION keys span multiple partitions; multi_key_strict is enabled".into(),
+        ));
+    }
+
+    // Phase 4 wire shape: fan-out runs locally for now (Phase 5+ will route
+    // remote buckets through the Forwarder). Remote buckets are reported as
+    // a PARTIAL with `first_error = "ErrServerGone (forwarder unwired)"`
+    // when not handled, so behaviour stays observable end-to-end.
+    let mut deleted = 0_i64;
+    let mut first_error: Option<String> = None;
+    if let Some(local_keys) = buckets.remove(&None) {
+        match dm_del_local_count(client, dmap, &local_keys).await {
+            Ok(n) => deleted += n,
+            Err(frame) => return Response::ok(frame),
+        }
+    }
+    for (_addr, _keys) in buckets {
+        if first_error.is_none() {
+            first_error = Some("ErrServerGone (cross-partition forward not wired)".into());
+        }
+    }
+
+    if let Some(err) = first_error {
+        return Response::ok(Frame::SimpleString(format!("PARTIAL {deleted} {err}")));
+    }
+    Response::ok(Frame::Integer(deleted))
+}
+
+async fn dm_del_local(client: &Arc<dyn Client>, dmap: &Bytes, keys: &[Bytes]) -> Response {
+    match dm_del_local_count(client, dmap, keys).await {
+        Ok(n) => Response::ok(Frame::Integer(n)),
+        Err(frame) => Response::ok(frame),
+    }
+}
+
+async fn dm_del_local_count(
+    client: &Arc<dyn Client>,
+    dmap: &Bytes,
+    keys: &[Bytes],
+) -> Result<i64, Frame> {
+    let d = dmap_handle(client, dmap).await?;
     let mut deleted = 0_i64;
     for key in keys {
-        let k = match key_str(key) {
-            Ok(s) => s,
-            Err(f) => return Response::ok(f),
-        };
+        let k = key_str(key)?;
         match d.delete(k).await {
             Ok(true) => deleted += 1,
             Ok(false) => {}
-            Err(e) => return Response::ok(map_client_error(e, "DM.DEL")),
+            Err(e) => return Err(map_client_error(e, "DM.DEL")),
         }
     }
-    Response::ok(Frame::Integer(deleted))
+    Ok(deleted)
 }
 
 pub(crate) async fn dm_expire(

@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::discovery::DiscoveryPlugin;
 use crate::error::{ClusterError, ClusterResult};
+use crate::forwarder::{Forwarder, ForwarderConfig};
 use crate::gossip::GossipQueue;
 use crate::join::{self, JoinParams};
 use crate::membership::MembershipView;
@@ -54,8 +55,9 @@ pub struct ClusterDeps {
     /// Hash function for the consistent-hash ring. `None` selects the
     /// default [`XxHasher`].
     pub hasher: Option<Arc<dyn Hasher>>,
-    /// Inter-node routing-table pusher. `None` uses [`LocalOnlyPusher`]
-    /// (Phase 4A default; the real Forwarder-based pusher lands in 4B).
+    /// Inter-node routing-table pusher. `None` defaults to a [`Forwarder`]
+    /// configured from `config.network.internode_*`; tests pass a custom
+    /// implementation (e.g. the in-process `DirectPusher`).
     pub routing_pusher: Option<Arc<dyn RoutingPusher>>,
 }
 
@@ -79,8 +81,10 @@ pub struct Cluster {
     routing_signature: Arc<SignatureClock>,
     hasher: Arc<dyn Hasher>,
     routing_pusher: Arc<dyn RoutingPusher>,
+    forwarder: Option<Forwarder>,
     core_config: kamino_core::config::CoreConfig,
     routing_config: kamino_core::config::RoutingConfig,
+    network_config: kamino_core::config::NetworkConfig,
     member_count_quorum: u32,
 }
 
@@ -97,9 +101,17 @@ impl Cluster {
             1,
         );
         let hasher: Arc<dyn Hasher> = deps.hasher.unwrap_or_else(|| Arc::new(XxHasher));
-        let routing_pusher: Arc<dyn RoutingPusher> = deps
-            .routing_pusher
-            .unwrap_or_else(|| Arc::new(LocalOnlyPusher));
+        let (routing_pusher, forwarder) = if let Some(p) = deps.routing_pusher {
+            (p, None)
+        } else {
+            let fwd = Forwarder::new(forwarder_config_from(&deps.config));
+            let pusher: Arc<dyn RoutingPusher> = Arc::new(fwd.clone());
+            (pusher, Some(fwd))
+        };
+        // `LocalOnlyPusher` stays available as the cluster-runtime-absent
+        // fallback (e.g. unit tests that instantiate a `Cluster` without
+        // any peer connectivity) — keep the import alive at the type level.
+        let _ = LocalOnlyPusher;
         Self {
             view,
             queue,
@@ -118,10 +130,27 @@ impl Cluster {
             routing_signature: SignatureClock::new(),
             hasher,
             routing_pusher,
+            forwarder,
             core_config: deps.config.core.clone(),
             routing_config: deps.config.routing.clone(),
+            network_config: deps.config.network.clone(),
             member_count_quorum: deps.config.core.member_count_quorum,
         }
+    }
+
+    /// Underlying inter-node forwarder if one was created by
+    /// `Cluster::assemble`. Returns `None` when the caller supplied a
+    /// custom `RoutingPusher` (typical in tests).
+    #[must_use]
+    pub fn forwarder(&self) -> Option<Forwarder> {
+        self.forwarder.clone()
+    }
+
+    /// `[network]` knobs for downstream wiring (e.g. server-side MOVED
+    /// thresholds and multi-key strictness).
+    #[must_use]
+    pub const fn network_config(&self) -> &kamino_core::config::NetworkConfig {
+        &self.network_config
     }
 
     /// Assemble the cluster, run `join()` (best-effort, capped by
@@ -457,6 +486,19 @@ pub trait RoutingProvider: Send + Sync {
 
     /// Current signature (0 if not populated).
     fn routing_signature(&self) -> u64;
+
+    /// Decide where a `(dmap, key)` should be handled. `None` keeps it
+    /// local. `Some(addr)` means "this server is not the primary; the
+    /// client should hit `addr` instead" — surfaced as `-MOVED` per
+    /// `docs/02-consistent-hashing.md`.
+    fn route_key(&self, dmap_name: &[u8], key: &[u8]) -> Option<SocketAddr>;
+
+    /// Partition id for `(dmap, key)` under the configured `partition_count`.
+    fn partition_for_key(&self, dmap_name: &[u8], key: &[u8]) -> u32;
+
+    /// Whether the server must reject multi-key requests that cross
+    /// partitions (`network.multi_key_strict`).
+    fn multi_key_strict(&self) -> bool;
 }
 
 impl RoutingProvider for Cluster {
@@ -475,6 +517,47 @@ impl RoutingProvider for Cluster {
 
     fn routing_signature(&self) -> u64 {
         Self::routing_signature(self)
+    }
+
+    fn route_key(&self, dmap_name: &[u8], key: &[u8]) -> Option<SocketAddr> {
+        let snap = self.routing_store.snapshot()?;
+        let part = crate::routing::partition_for(
+            self.hasher.as_ref(),
+            dmap_name,
+            key,
+            self.core_config.partition_count,
+        );
+        let primary = snap.primary_for(part)?;
+        if primary.id == self.local_id {
+            None
+        } else {
+            Some(primary.addr)
+        }
+    }
+
+    fn partition_for_key(&self, dmap_name: &[u8], key: &[u8]) -> u32 {
+        crate::routing::partition_for(
+            self.hasher.as_ref(),
+            dmap_name,
+            key,
+            self.core_config.partition_count,
+        )
+    }
+
+    fn multi_key_strict(&self) -> bool {
+        self.network_config.multi_key_strict
+    }
+}
+
+fn forwarder_config_from(cfg: &kamino_core::config::Config) -> ForwarderConfig {
+    ForwarderConfig {
+        pool_size: cfg.network.internode_pool_size,
+        inflight_per_conn: cfg.network.internode_inflight_per_conn,
+        connect_timeout: cfg.network.internode_connect_timeout,
+        request_timeout: cfg.network.internode_request_timeout,
+        reconnect_backoff_min: cfg.network.internode_reconnect_backoff_min,
+        reconnect_backoff_max: cfg.network.internode_reconnect_backoff_max,
+        cluster_secret: cfg.auth.cluster_secret.clone(),
     }
 }
 

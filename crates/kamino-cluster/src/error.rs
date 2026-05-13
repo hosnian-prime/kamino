@@ -39,6 +39,22 @@ pub enum ClusterError {
     /// The runtime has shut down.
     #[error("cluster runtime shut down")]
     Shutdown,
+
+    /// Inter-node forwarder: the destination peer is no longer reachable
+    /// (TCP disconnect, drained pool, SWIM marked dead). The originating
+    /// client should refresh routing and retry against the new owner.
+    #[error("server gone: {0}")]
+    ServerGone(String),
+
+    /// Inter-node forwarder: per-RPC deadline (`internode_request_timeout`)
+    /// elapsed.
+    #[error("forwarded RPC timed out: {0}")]
+    Timeout(String),
+
+    /// Inter-node forwarder: peer answered with `-MOVED ...`. Local routing
+    /// was stale; the caller refreshed and may retry once.
+    #[error("MOVED: {0}")]
+    Moved(String),
 }
 
 /// Convenience alias.

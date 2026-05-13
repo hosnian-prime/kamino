@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use kamino_client::Client;
 use kamino_cluster::{MemberProvider, RoutingProvider};
 use kamino_protocol::{Command, Frame};
@@ -55,6 +56,10 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
         return Response::ok(Frame::Error(NOAUTH.into()));
     }
 
+    if let Some(moved) = check_routing(ctx, &cmd) {
+        return moved;
+    }
+
     match cmd {
         Command::Ping(msg) => handlers::ping(msg.as_ref()),
         Command::Auth { username, password } => {
@@ -71,7 +76,9 @@ pub(crate) async fn dispatch(ctx: &ServerContext, state: &mut ConnState, cmd: Co
             options,
         } => handlers::dm_put(&ctx.client, &dmap, &key, &value, options).await,
         Command::DmGet { dmap, key } => handlers::dm_get(&ctx.client, &dmap, &key).await,
-        Command::DmDel { dmap, keys } => handlers::dm_del(&ctx.client, &dmap, &keys).await,
+        Command::DmDel { dmap, keys } => {
+            handlers::dm_del(&ctx.client, ctx.routing_provider.as_ref(), &dmap, &keys).await
+        }
         Command::DmExpire { dmap, key, seconds } => {
             handlers::dm_expire(&ctx.client, &dmap, &key, Duration::from_secs(seconds)).await
         }
@@ -128,6 +135,32 @@ const fn is_pre_auth_command(cmd: &Command) -> bool {
         cmd,
         Command::Ping(_) | Command::Auth { .. } | Command::Hello(_) | Command::Quit
     )
+}
+
+/// Per `docs/02-consistent-hashing.md`, a node that receives a single-key
+/// DM.* command for a partition it does not own returns `-MOVED <part>
+/// <addr>`. The client then refreshes routing and retries (Phase 4).
+///
+/// `DM.DEL` is special because it may carry many keys; the multi-key
+/// fan-out path lives in `handlers::dm_del` so we let it through here.
+/// `DM.SCAN` carries an explicit `partition_id` and is allowed against any
+/// node — the scan source treats it as an explicit pin.
+fn check_routing(ctx: &ServerContext, cmd: &Command) -> Option<Response> {
+    let provider = ctx.routing_provider.as_ref()?;
+    let (dmap, key): (&Bytes, &Bytes) = match cmd {
+        Command::DmPut { dmap, key, .. }
+        | Command::DmGet { dmap, key }
+        | Command::DmExpire { dmap, key, .. }
+        | Command::DmPexpire { dmap, key, .. }
+        | Command::DmIncr { dmap, key, .. }
+        | Command::DmDecr { dmap, key, .. }
+        | Command::DmGetPut { dmap, key, .. }
+        | Command::DmIncrByFloat { dmap, key, .. } => (dmap, key),
+        _ => return None,
+    };
+    let target = provider.route_key(dmap, key)?;
+    let part = provider.partition_for_key(dmap, key);
+    Some(Response::ok(Frame::Error(format!("MOVED {part} {target}"))))
 }
 
 /// Translate a parser error into an `-ERR ...` frame.
@@ -376,5 +409,165 @@ mod tests {
     fn parse_error_translates() {
         let f = parse_error_frame(&kamino_protocol::CommandError::NotAnArray);
         assert!(matches!(f, Frame::Error(ref e) if e.starts_with("ERR")));
+    }
+
+    // ---- Phase 4 routing-dispatch tests --------------------------------
+
+    use kamino_cluster::{ApplyRoutingOutcome, ClusterError, RoutingProvider};
+
+    /// `RoutingProvider` stub: every single-key DM.* is "owned by" the
+    /// `forced` socket addr; `multi_key_strict` is toggleable.
+    #[derive(Debug)]
+    struct StubRouter {
+        forced: Option<std::net::SocketAddr>,
+        strict: bool,
+    }
+
+    impl RoutingProvider for StubRouter {
+        fn routing_table_bytes(&self) -> Option<Vec<u8>> {
+            None
+        }
+        fn apply_routing_update(
+            &self,
+            _bytes: &[u8],
+        ) -> Result<ApplyRoutingOutcome, ClusterError> {
+            Ok(ApplyRoutingOutcome::Accepted)
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn routing_signature(&self) -> u64 {
+            1
+        }
+        fn route_key(
+            &self,
+            _dmap_name: &[u8],
+            _key: &[u8],
+        ) -> Option<std::net::SocketAddr> {
+            self.forced
+        }
+        fn partition_for_key(&self, _dmap_name: &[u8], _key: &[u8]) -> u32 {
+            7
+        }
+        fn multi_key_strict(&self) -> bool {
+            self.strict
+        }
+    }
+
+    fn ctx_with_router(router: Arc<dyn RoutingProvider>) -> ServerContext {
+        ServerContext {
+            client: dummy_client(),
+            password: String::new(),
+            metrics: Arc::new(ServerMetrics::new()),
+            version: "0.0.0",
+            id: 1,
+            member_provider: None,
+            routing_provider: Some(router),
+        }
+    }
+
+    #[tokio::test]
+    async fn dm_get_to_wrong_owner_emits_moved() {
+        let forced = "127.0.0.1:9999".parse().unwrap();
+        let router: Arc<dyn RoutingProvider> = Arc::new(StubRouter {
+            forced: Some(forced),
+            strict: false,
+        });
+        let ctx = ctx_with_router(router);
+        let mut st = ConnState::new(false);
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmGet {
+                dmap: Bytes::from_static(b"dm"),
+                key: Bytes::from_static(b"k"),
+            },
+        )
+        .await;
+        let Frame::Error(msg) = resp.frame else {
+            panic!("expected -MOVED error frame");
+        };
+        assert!(
+            msg.starts_with("MOVED 7 127.0.0.1:9999"),
+            "got {msg:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_get_to_local_owner_proceeds() {
+        let router: Arc<dyn RoutingProvider> = Arc::new(StubRouter {
+            forced: None,
+            strict: false,
+        });
+        let ctx = ctx_with_router(router);
+        let mut st = ConnState::new(false);
+        // The null client returns Unsupported("new_dmap") — that's fine, we
+        // only care that the dispatcher did not short-circuit with MOVED.
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmGet {
+                dmap: Bytes::from_static(b"dm"),
+                key: Bytes::from_static(b"k"),
+            },
+        )
+        .await;
+        match resp.frame {
+            Frame::Error(ref e) => {
+                assert!(!e.starts_with("MOVED"), "expected non-MOVED, got {e:?}");
+            }
+            _ => {} // any non-MOVED reply is fine here
+        }
+    }
+
+    #[tokio::test]
+    async fn dm_del_multi_key_strict_rejects_cross_partition() {
+        let forced = "127.0.0.1:9999".parse().unwrap();
+        let router: Arc<dyn RoutingProvider> = Arc::new(StubRouter {
+            forced: Some(forced),
+            strict: true,
+        });
+        let ctx = ctx_with_router(router);
+        let mut st = ConnState::new(false);
+        // Two keys both route to the remote owner under our stub; with
+        // `strict = true` that crosses-partitions (router != local) so
+        // the handler must respond with `-CROSSPARTITION`.
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmDel {
+                dmap: Bytes::from_static(b"dm"),
+                keys: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            },
+        )
+        .await;
+        let Frame::Error(msg) = resp.frame else {
+            panic!("expected -CROSSPARTITION");
+        };
+        assert!(msg.starts_with("CROSSPARTITION"), "got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn dm_del_lenient_partial_when_cross_partition() {
+        let forced = "127.0.0.1:9999".parse().unwrap();
+        let router: Arc<dyn RoutingProvider> = Arc::new(StubRouter {
+            forced: Some(forced),
+            strict: false,
+        });
+        let ctx = ctx_with_router(router);
+        let mut st = ConnState::new(false);
+        let resp = dispatch(
+            &ctx,
+            &mut st,
+            Command::DmDel {
+                dmap: Bytes::from_static(b"dm"),
+                keys: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            },
+        )
+        .await;
+        let Frame::SimpleString(s) = resp.frame else {
+            panic!("expected +PARTIAL simple-string reply");
+        };
+        assert!(s.starts_with("PARTIAL"), "got {s:?}");
     }
 }

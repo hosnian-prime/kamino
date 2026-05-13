@@ -84,6 +84,12 @@ pub enum Error {
     /// rejected.
     #[error("auth required: {0}")]
     Auth(String),
+
+    /// Server returned `-MOVED <partition> <addr>` (per
+    /// `docs/02-consistent-hashing.md`). The remote client refreshes its
+    /// routing view and retries once before surfacing this to the caller.
+    #[error("MOVED {partition} {addr}")]
+    Moved { partition: u32, addr: String },
 }
 
 impl From<kamino_storage::Error> for Error {
