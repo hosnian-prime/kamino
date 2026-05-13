@@ -3,6 +3,12 @@
 //! Phase 2 scope: single-node, no SWIM, no routing. Wraps an embedded
 //! `kamino_client::EmbeddedClient` and dispatches RESP commands against it.
 
+// `pub(crate)` is the right visibility for the cross-module wiring used by
+// the connection / dispatch / handlers split. Clippy's `redundant_pub_crate`
+// (nursery) flags it because everything is in private modules, but the
+// alternative — `pub` — would actually be wider. Suppress crate-wide.
+#![allow(clippy::redundant_pub_crate)]
+
 mod connection;
 mod dispatch;
 mod handlers;
@@ -184,18 +190,15 @@ impl Server {
             }
         }
 
-        let drain = async {
-            while conns.join_next().await.is_some() {}
-        };
-        match tokio::time::timeout(drain_grace, drain).await {
-            Ok(()) => info!("all connections drained cleanly"),
-            Err(_) => {
-                warn!(
-                    "drain grace expired with {} connection(s) still active; aborting",
-                    conns.len()
-                );
-                conns.shutdown().await;
-            }
+        let drain = async { while conns.join_next().await.is_some() {} };
+        if tokio::time::timeout(drain_grace, drain).await.is_err() {
+            warn!(
+                "drain grace expired with {} connection(s) still active; aborting",
+                conns.len()
+            );
+            conns.shutdown().await;
+        } else {
+            info!("all connections drained cleanly");
         }
         Ok(())
     }

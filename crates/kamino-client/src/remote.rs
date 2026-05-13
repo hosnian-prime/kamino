@@ -101,7 +101,9 @@ struct RemoteInner {
 
 impl std::fmt::Debug for RemoteInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteInner").field("addr", &self.addr).finish()
+        f.debug_struct("RemoteInner")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
     }
 }
 
@@ -190,21 +192,14 @@ impl Client for RemoteClient {
         let frame = self.send(Command::Stats).await?;
         check_not_error(&frame)?;
         // `STATS` returns an Array of bulk key/value pairs.
-        let items = match frame {
-            Frame::Array(Some(items)) => items,
-            _ => {
-                return Err(Error::Protocol(
-                    "STATS expected Array(Some(_))".into(),
-                ));
-            }
+        let Frame::Array(Some(items)) = frame else {
+            return Err(Error::Protocol("STATS expected Array(Some(_))".into()));
         };
         let mut map = std::collections::BTreeMap::<String, String>::new();
         let mut it = items.into_iter();
         while let (Some(k), Some(v)) = (it.next(), it.next()) {
             if let (Frame::Bulk(BulkString(Some(kb))), Frame::Bulk(BulkString(Some(vb)))) = (k, v) {
-                if let (Ok(ks), Ok(vs)) =
-                    (std::str::from_utf8(&kb), std::str::from_utf8(&vb))
-                {
+                if let (Ok(ks), Ok(vs)) = (std::str::from_utf8(&kb), std::str::from_utf8(&vb)) {
                     map.insert(ks.to_string(), vs.to_string());
                 }
             }
@@ -235,13 +230,13 @@ impl Client for RemoteClient {
 
     async fn close(&self) -> Result<()> {
         // Drop the command channel: writer exits, then reader sees EOF.
-        // We can't take the receiver out from a shared `Arc`, so signal via
-        // the channel's close-on-drop semantics by swapping out the inner.
         let _ = self.send(Command::Quit).await;
-        if let Some(h) = self.inner.writer_handle.lock().take() {
+        let writer = self.inner.writer_handle.lock().take();
+        if let Some(h) = writer {
             h.abort();
         }
-        if let Some(h) = self.inner.reader_handle.lock().take() {
+        let reader = self.inner.reader_handle.lock().take();
+        if let Some(h) = reader {
             h.abort();
         }
         Ok(())
@@ -329,7 +324,9 @@ impl DMap for RemoteDMap {
                 }
             }
             Frame::Error(e) => Err(translate_error(&e)),
-            other => Err(Error::Protocol(format!("DM.PUT unexpected reply: {other:?}"))),
+            other => Err(Error::Protocol(format!(
+                "DM.PUT unexpected reply: {other:?}"
+            ))),
         }
     }
 
@@ -581,19 +578,19 @@ where
             self.in_flight.lock().push_back(slot);
             if let Err(e) = self.sink.send(frame).await {
                 warn!(?e, "remote-client send error; failing in-flight");
-                self.fail_all(ConnError::Protocol(e.to_string()));
+                self.fail_all(&ConnError::Protocol(e.to_string()));
                 return;
             }
         }
         // Channel closed by client drop / close().
-        self.fail_all(ConnError::Closed("client dropped".into()));
+        self.fail_all(&ConnError::Closed("client dropped".into()));
         debug!("remote-client writer exiting");
     }
 
-    fn fail_all(&self, err: ConnError) {
+    fn fail_all(&self, err: &ConnError) {
         let mut q = self.in_flight.lock();
         while let Some(slot) = q.pop_front() {
-            let _ = slot.send(Err(clone_err(&err)));
+            let _ = slot.send(Err(clone_err(err)));
         }
     }
 }
@@ -613,7 +610,7 @@ where
                 Ok(f) => f,
                 Err(e) => {
                     warn!(?e, "remote-client decode error; failing in-flight");
-                    self.fail_all(ConnError::Protocol(e.to_string()));
+                    self.fail_all(&ConnError::Protocol(e.to_string()));
                     return;
                 }
             };
@@ -624,14 +621,14 @@ where
                 debug!(?frame, "frame with no matching slot; discarding");
             }
         }
-        self.fail_all(ConnError::Closed("server closed connection".into()));
+        self.fail_all(&ConnError::Closed("server closed connection".into()));
         debug!("remote-client reader exiting");
     }
 
-    fn fail_all(&self, err: ConnError) {
+    fn fail_all(&self, err: &ConnError) {
         let mut q = self.in_flight.lock();
         while let Some(slot) = q.pop_front() {
-            let _ = slot.send(Err(clone_err(&err)));
+            let _ = slot.send(Err(clone_err(err)));
         }
     }
 }

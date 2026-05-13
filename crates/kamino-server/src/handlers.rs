@@ -39,10 +39,10 @@ const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is dis
 const NO_PASSWORD_SET: &str = "ERR Client sent AUTH, but no password is set";
 
 pub(crate) fn ping(message: Option<&Bytes>) -> Response {
-    let frame = match message {
-        None => Frame::SimpleString("PONG".into()),
-        Some(m) => Frame::Bulk(BulkString::from_bytes(m.clone())),
-    };
+    let frame = message.map_or_else(
+        || Frame::SimpleString("PONG".into()),
+        |m| Frame::Bulk(BulkString::from_bytes(m.clone())),
+    );
     Response::ok(frame)
 }
 
@@ -226,7 +226,7 @@ async fn dmap_handle(client: &Arc<dyn Client>, name: &Bytes) -> Result<Arc<dyn D
         .map_err(|e| map_client_error(e, "DM.*"))
 }
 
-fn key_str<'a>(key: &'a Bytes) -> Result<&'a str, Frame> {
+fn key_str(key: &Bytes) -> Result<&str, Frame> {
     std::str::from_utf8(key).map_err(|e| Frame::Error(format!("ERR invalid key utf-8: {e}")))
 }
 

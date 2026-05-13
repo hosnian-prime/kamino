@@ -1,4 +1,5 @@
 //! Kamino server binary entry point.
+#![allow(clippy::redundant_pub_crate)] // tokio::select! expansion
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -161,13 +162,11 @@ fn spawn_workers(
 #[cfg(unix)]
 async fn wait_for_signal() {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut sigint = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+        return;
     };
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+        return;
     };
     tokio::select! {
         _ = sigint.recv() => {},

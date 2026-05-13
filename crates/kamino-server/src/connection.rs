@@ -83,18 +83,16 @@ pub(crate) async fn run_connection(
             }
             RunStep::Frame(Some(Err(e))) => {
                 warn!(?e, "protocol error on frame decode; closing connection");
-                let _ = SinkExt::<Frame>::send(
-                    &mut framed,
-                    Frame::Error(format!("ERR protocol: {e}")),
-                )
-                .await;
+                let _ =
+                    SinkExt::<Frame>::send(&mut framed, Frame::Error(format!("ERR protocol: {e}")))
+                        .await;
                 break;
             }
             RunStep::Frame(Some(Ok(frame))) => {
                 let cmd = match Command::parse(frame) {
                     Ok(c) => c,
                     Err(err) => {
-                        let f = dispatch::parse_error_frame(err);
+                        let f = dispatch::parse_error_frame(&err);
                         if let Err(e) = SinkExt::<Frame>::send(&mut framed, f).await {
                             warn!(?e, "send failed for parse-error frame");
                             break;

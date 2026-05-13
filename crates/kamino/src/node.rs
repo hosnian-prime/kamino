@@ -1,6 +1,8 @@
-//! `Kamino` builder — wires up an [`EmbeddedClient`], a [`Locker`], and the
-//! eviction workers from a [`Config`]. In standalone mode it additionally
-//! owns the RESP listener exposed via [`kamino_server::Server`].
+//! `Kamino` builder.
+//!
+//! Wires up an [`EmbeddedClient`], a [`Locker`], and the eviction workers
+//! from a [`Config`]. In standalone mode it additionally owns the RESP
+//! listener exposed via [`kamino_server::Server`].
 
 use std::sync::Arc;
 use std::time::Duration;
