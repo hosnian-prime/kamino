@@ -7,6 +7,7 @@
 
 pub mod node;
 
+pub use kamino_server::{Server, ServerError, ShutdownHandle};
 pub use node::{Kamino, KaminoError};
 
 // Re-exports of the consumer-facing surface.

@@ -18,11 +18,21 @@ path = "src/bin/kamino-server.rs"
 [dependencies]
 kamino-core = { workspace = true }
 kamino-protocol = { workspace = true }
+kamino-storage = { workspace = true }
+kamino-client = { workspace = true }
 kamino-cluster = { workspace = true }
 kamino-observability = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 bytes = { workspace = true }
+socket2 = "0.5"
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+async-trait = { workspace = true }
