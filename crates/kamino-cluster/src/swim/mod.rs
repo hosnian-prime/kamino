@@ -11,27 +11,34 @@
 //! The implementation lives in submodules below so unit tests can target
 //! each piece in isolation without spinning up real UDP sockets.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use kamino_core::clock::Clock;
 use kamino_core::config::SwimConfig;
 use kamino_core::ids::MemberId;
+use parking_lot::Mutex as SyncMutex;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::gossip::GossipQueue;
 use crate::membership::MembershipView;
 use crate::transport::Transport;
 
+/// Map of in-flight probe sequence numbers to a oneshot that the receive loop
+/// fires when the matching `Ack` or `IndirectAck` arrives.
+pub(crate) type InFlightMap = Arc<SyncMutex<HashMap<u64, oneshot::Sender<()>>>>;
+
 impl std::fmt::Debug for SwimDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SwimDriver")
             .field("config", &self.config)
             .field("cluster_secret_set", &!self.cluster_secret.is_empty())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -49,6 +56,16 @@ pub struct SwimDriver {
     pub cancel: CancellationToken,
     /// Per-driver RNG, seeded deterministically in tests.
     pub rng: AsyncMutex<SmallRng>,
+    /// In-flight probes keyed by sequence number. The probe loop registers a
+    /// `oneshot::Sender` before sending a `Ping` (or `PingReq`); the receive
+    /// loop fires the matching sender when the corresponding `Ack` /
+    /// `IndirectAck` arrives. Internal coordination only — never exposed.
+    pub(crate) in_flight: InFlightMap,
+    /// Monotonically incrementing probe sequence counter, shared between any
+    /// probe-issuing tasks. `AtomicU64` rather than relying on the RNG so
+    /// indirect probes can chain a fresh seq without contending for the RNG
+    /// lock.
+    pub(crate) probe_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SwimDriver {
@@ -72,6 +89,36 @@ impl SwimDriver {
             cluster_secret,
             cancel,
             rng: AsyncMutex::new(SmallRng::from_entropy()),
+            in_flight: Arc::new(SyncMutex::new(HashMap::new())),
+            probe_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        }
+    }
+
+    /// Allocate the next probe sequence number.
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.probe_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Register a oneshot for an in-flight probe and return the receiver. The
+    /// caller drops the receiver when the wait completes (or times out) to
+    /// release the slot; the receive loop also evicts the entry when it fires.
+    pub(crate) fn register_inflight(&self, seq: u64) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.in_flight.lock().insert(seq, tx);
+        rx
+    }
+
+    /// Forget an in-flight probe (after timeout, on cancel, etc.).
+    pub(crate) fn forget_inflight(&self, seq: u64) {
+        self.in_flight.lock().remove(&seq);
+    }
+
+    /// Fire the oneshot for `seq` if registered. Called by the receive loop.
+    pub(crate) fn complete_inflight(&self, seq: u64) {
+        let tx = self.in_flight.lock().remove(&seq);
+        if let Some(tx) = tx {
+            let _ = tx.send(());
         }
     }
 
@@ -105,4 +152,6 @@ impl SwimDriver {
 }
 
 pub mod loops;
+#[cfg(any(test, feature = "mock-transport"))]
+pub use loops::probe_once;
 pub use loops::{ProbeOutcome, run_probe_loop, run_receive_loop};
