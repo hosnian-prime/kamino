@@ -21,7 +21,18 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+/// Options accepted by [`crate::Client::new_pubsub`].
+///
+/// Phase 7 ships no tunable knobs — the struct exists so the call shape
+/// (`client.new_pubsub(Default::default())?`) matches `docs/08-api-design.md`
+/// and `docs/11-pubsub.md` exactly and so future surfaces (per-handle
+/// queue depth, RESP3 push toggle for embedded subscribers, etc.) can
+/// be added without breaking call sites.
+#[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
+pub struct PubSubOptions {}
 
 /// One delivered message handed to the subscriber.
 #[derive(Debug, Clone)]
@@ -73,11 +84,27 @@ impl Subscription {
         self
     }
 
-    /// Wait for the next delivered message. Returns `None` once the
-    /// underlying channel closes (the service was dropped or the
-    /// connection was cleaned up server-side).
-    pub async fn recv(&mut self) -> Option<Message> {
-        self.receiver.recv().await
+    /// Wait for the next delivered message.
+    ///
+    /// Returns `Err(Error::SubscriptionClosed)` once the underlying
+    /// channel closes — either the service was dropped or the registry
+    /// cleaned up this connection. Matches the wire example in
+    /// `docs/11-pubsub.md` where the typical caller does
+    /// `match subscription.recv().await { Ok(msg) => ..., Err(_) => break }`.
+    pub async fn recv(&mut self) -> Result<Message> {
+        self.receiver.recv().await.ok_or(Error::SubscriptionClosed)
+    }
+
+    /// Non-blocking variant of [`Self::recv`]. Returns `Ok(None)` when
+    /// the queue is empty but the subscription is still alive,
+    /// `Err(Error::SubscriptionClosed)` when the publisher side dropped.
+    pub fn try_recv(&mut self) -> Result<Option<Message>> {
+        use tokio::sync::mpsc::error::TryRecvError;
+        match self.receiver.try_recv() {
+            Ok(m) => Ok(Some(m)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(Error::SubscriptionClosed),
+        }
     }
 }
 

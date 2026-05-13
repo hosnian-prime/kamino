@@ -218,7 +218,10 @@ impl Client for EmbeddedClient {
         Ok(applied)
     }
 
-    fn new_pubsub(&self) -> Result<Arc<dyn crate::pubsub::PubSub>> {
+    fn new_pubsub(
+        &self,
+        _options: crate::pubsub::PubSubOptions,
+    ) -> Result<Arc<dyn crate::pubsub::PubSub>> {
         Ok(Arc::new(crate::pubsub::EmbeddedPubSub::new(Arc::clone(
             &self.pubsub,
         ))))

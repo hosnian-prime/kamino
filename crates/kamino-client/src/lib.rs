@@ -29,7 +29,7 @@ pub use lock::LockContext;
 pub use migration::{FRAGMENT_PAYLOAD_TAG_V1, decode_fragment_payload, encode_fragment_payload};
 pub use multi_node::MultiNodeRemoteClient;
 pub use pipeline::{Pipeline, PipelineOptions, PipelineResult};
-pub use pubsub::{EmbeddedPubSub, Message, PubSub, Subscription};
+pub use pubsub::{EmbeddedPubSub, Message, PubSub, PubSubOptions, Subscription};
 pub use remote::{RemoteClient, RemoteDMap};
 pub use stats::{DMapStats, Stats, StatsOptions};
 pub use traits::Client;

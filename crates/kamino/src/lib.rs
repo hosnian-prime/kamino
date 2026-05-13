@@ -12,8 +12,9 @@ pub use node::{Kamino, KaminoError};
 
 // Re-exports of the consumer-facing surface.
 pub use kamino_client::{
-    Client, DMap, DMapOptions, Error as ClientError, GetResponse, LockContext, PutOptions,
-    Result as ClientResult, ScanCursor, ScanOptions, Stats, StatsOptions,
+    Client, DMap, DMapOptions, EmbeddedPubSub, Error as ClientError, GetResponse, LockContext,
+    Message as PubSubMessage, PubSub, PubSubOptions, PutOptions, Result as ClientResult,
+    ScanCursor, ScanOptions, Stats, StatsOptions, Subscription,
 };
 pub use kamino_core::{
     Clock, Config, Error as CoreError, Hasher, MemberId, Mode, Profile, Result as CoreResult,

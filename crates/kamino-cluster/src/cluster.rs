@@ -414,50 +414,43 @@ impl Cluster {
         events: Arc<dyn ClusterEventsSink>,
         interval: std::time::Duration,
     ) {
+        type Snapshot =
+            std::collections::BTreeMap<kamino_core::ids::MemberId, (String, std::net::SocketAddr)>;
+        fn build_snapshot(view: &MembershipView, local_id: MemberId) -> Snapshot {
+            view.snapshot()
+                .into_iter()
+                .filter(|m| m.id != local_id)
+                .map(|m| (m.id, (m.name, m.addr)))
+                .collect()
+        }
         let view = self.view.clone();
         let local_id = self.local_id;
         let cancel = self.cancel.clone();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // skip the immediate first tick
-            let mut last: std::collections::BTreeMap<
-                kamino_core::ids::MemberId,
-                std::net::SocketAddr,
-            > = view
-                .snapshot()
-                .into_iter()
-                .filter(|m| m.id != local_id)
-                .map(|m| (m.id, m.addr))
-                .collect();
+            let mut last: Snapshot = build_snapshot(&view, local_id);
             loop {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => return,
                     _ = ticker.tick() => {}
                 }
-                let now: std::collections::BTreeMap<
-                    kamino_core::ids::MemberId,
-                    std::net::SocketAddr,
-                > = view
-                    .snapshot()
-                    .into_iter()
-                    .filter(|m| m.id != local_id)
-                    .map(|m| (m.id, m.addr))
-                    .collect();
+                let now: Snapshot = build_snapshot(&view, local_id);
                 // Find new members (in `now` but not in `last`).
-                for (id, addr) in &now {
+                for (id, (name, addr)) in &now {
                     if !last.contains_key(id) {
                         events.publish(ClusterEvent::NodeJoin {
-                            member: format!("{id:?}"),
+                            member: name.clone(),
                             addr: *addr,
                         });
                     }
                 }
                 // Find departed members (in `last` but not in `now`).
-                for (id, addr) in &last {
+                for (id, (name, addr)) in &last {
                     if !now.contains_key(id) {
                         events.publish(ClusterEvent::NodeLeft {
-                            member: format!("{id:?}"),
+                            member: name.clone(),
                             addr: *addr,
                         });
                     }
@@ -1106,13 +1099,21 @@ impl PubSubProvider for Cluster {
 #[derive(Debug)]
 pub struct PubSubEventsSink {
     service: Arc<PubSubService>,
+    /// Local node's `Member.name`. Used to fill the `"from"`/`"to"`
+    /// fields in `cluster.events` JSON so the rendered shape matches
+    /// `docs/11-pubsub.md` (`{"type":"fragment-migration","from":"node-1","to":"node-3"}`).
+    local_name: String,
 }
 
 impl PubSubEventsSink {
-    /// Build a sink that writes into the supplied [`PubSubService`].
+    /// Build a sink that writes into the supplied [`PubSubService`]
+    /// using `local_name` as the local-node label in rendered JSON.
     #[must_use]
-    pub const fn new(service: Arc<PubSubService>) -> Self {
-        Self { service }
+    pub const fn new(service: Arc<PubSubService>, local_name: String) -> Self {
+        Self {
+            service,
+            local_name,
+        }
     }
 }
 
@@ -1121,28 +1122,34 @@ const CLUSTER_EVENTS_CHANNEL: &str = "cluster.events";
 impl ClusterEventsSink for PubSubEventsSink {
     fn publish(&self, event: ClusterEvent) {
         let payload = match &event {
+            // FragmentMigration is published by the *sender*, so
+            // `from = self`, `to = peer`.
             ClusterEvent::FragmentMigration {
                 dmap,
                 partition_id,
                 peer,
                 entries,
             } => format!(
-                "{{\"type\":\"fragment-migration\",\"dmap\":\"{}\",\"partition\":{},\"peer\":\"{}\",\"entries\":{}}}",
+                "{{\"type\":\"fragment-migration\",\"dmap\":\"{}\",\"partition\":{},\"from\":\"{}\",\"to\":\"{}\",\"entries\":{}}}",
                 escape_json(dmap),
                 partition_id,
+                escape_json(&self.local_name),
                 peer,
                 entries,
             ),
+            // FragmentReceived is published by the *receiver*, so
+            // `from = peer`, `to = self`.
             ClusterEvent::FragmentReceived {
                 dmap,
                 partition_id,
                 peer,
                 applied,
             } => format!(
-                "{{\"type\":\"fragment-received\",\"dmap\":\"{}\",\"partition\":{},\"peer\":\"{}\",\"applied\":{}}}",
+                "{{\"type\":\"fragment-received\",\"dmap\":\"{}\",\"partition\":{},\"from\":\"{}\",\"to\":\"{}\",\"applied\":{}}}",
                 escape_json(dmap),
                 partition_id,
                 peer,
+                escape_json(&self.local_name),
                 applied,
             ),
             ClusterEvent::NodeJoin { member, addr } => format!(
@@ -1212,5 +1219,100 @@ impl From<&Member> for MemberSummary {
             birthdate: m.birthdate,
             is_coordinator: m.is_coordinator,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Phase 7 cross-check: `PubSubEventsSink` renders the doc-mandated
+    //! JSON shape (`docs/11-pubsub.md` "Cluster Event Channel"):
+    //!
+    //! ```json
+    //! { "type": "node-join",          "member": "node-3", "addr": "10.0.1.3:3320" }
+    //! { "type": "node-left",          "member": "node-2", "addr": "10.0.1.2:3320" }
+    //! { "type": "fragment-migration", "partition": 42, "from": "node-1", "to": "node-3" }
+    //! ```
+    use super::*;
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+
+    fn collect_one(service: &Arc<PubSubService>) -> mpsc::Receiver<DeliveredMessage> {
+        let id = service.next_conn_id();
+        let (tx, rx) = mpsc::channel(8);
+        service.register_conn(id, tx);
+        service.subscribe(id, &[Bytes::from_static(b"cluster.events")]);
+        rx
+    }
+
+    async fn drain_one(rx: &mut mpsc::Receiver<DeliveredMessage>) -> String {
+        let m = rx.recv().await.expect("event delivered");
+        String::from_utf8(m.payload.to_vec()).expect("utf8")
+    }
+
+    #[tokio::test]
+    async fn fragment_migration_renders_from_to_per_doc() {
+        let svc = Arc::new(PubSubService::new());
+        let mut rx = collect_one(&svc);
+        let sink = PubSubEventsSink::new(Arc::clone(&svc), "node-1".into());
+        sink.publish(ClusterEvent::FragmentMigration {
+            dmap: "sessions".into(),
+            partition_id: 42,
+            peer: "10.0.1.3:3320".parse().unwrap(),
+            entries: 7,
+        });
+        let body = drain_one(&mut rx).await;
+        assert!(body.contains("\"type\":\"fragment-migration\""));
+        assert!(body.contains("\"partition\":42"));
+        assert!(body.contains("\"from\":\"node-1\""));
+        assert!(body.contains("\"to\":\"10.0.1.3:3320\""));
+        assert!(body.contains("\"entries\":7"));
+    }
+
+    #[tokio::test]
+    async fn fragment_received_renders_from_to_inverted() {
+        let svc = Arc::new(PubSubService::new());
+        let mut rx = collect_one(&svc);
+        let sink = PubSubEventsSink::new(Arc::clone(&svc), "node-3".into());
+        sink.publish(ClusterEvent::FragmentReceived {
+            dmap: "sessions".into(),
+            partition_id: 42,
+            peer: "10.0.1.1:3320".parse().unwrap(),
+            applied: 5,
+        });
+        let body = drain_one(&mut rx).await;
+        assert!(body.contains("\"type\":\"fragment-received\""));
+        // The receiver side renders `from = peer`, `to = self`.
+        assert!(body.contains("\"from\":\"10.0.1.1:3320\""));
+        assert!(body.contains("\"to\":\"node-3\""));
+        assert!(body.contains("\"applied\":5"));
+    }
+
+    #[tokio::test]
+    async fn node_join_uses_member_name() {
+        let svc = Arc::new(PubSubService::new());
+        let mut rx = collect_one(&svc);
+        let sink = PubSubEventsSink::new(Arc::clone(&svc), "node-1".into());
+        sink.publish(ClusterEvent::NodeJoin {
+            member: "node-3".into(),
+            addr: "10.0.1.3:3320".parse().unwrap(),
+        });
+        let body = drain_one(&mut rx).await;
+        assert!(body.contains("\"type\":\"node-join\""));
+        assert!(body.contains("\"member\":\"node-3\""));
+        assert!(body.contains("\"addr\":\"10.0.1.3:3320\""));
+    }
+
+    #[tokio::test]
+    async fn node_left_uses_member_name() {
+        let svc = Arc::new(PubSubService::new());
+        let mut rx = collect_one(&svc);
+        let sink = PubSubEventsSink::new(Arc::clone(&svc), "node-1".into());
+        sink.publish(ClusterEvent::NodeLeft {
+            member: "node-2".into(),
+            addr: "10.0.1.2:3320".parse().unwrap(),
+        });
+        let body = drain_one(&mut rx).await;
+        assert!(body.contains("\"type\":\"node-left\""));
+        assert!(body.contains("\"member\":\"node-2\""));
     }
 }

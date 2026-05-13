@@ -162,8 +162,10 @@ impl Server {
         // tracing-only sink.
         let events_sink: Option<Arc<dyn kamino_cluster::ClusterEventsSink>> =
             if cluster.events_channel_enabled() {
+                let local_name = cluster.local_member().name;
                 Some(Arc::new(kamino_cluster::PubSubEventsSink::new(
                     cluster.pubsub(),
+                    local_name,
                 )))
             } else {
                 None

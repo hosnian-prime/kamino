@@ -538,7 +538,65 @@ fn mismatch_backtrack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tokio::sync::mpsc;
+
+    /// Reference implementation: convert a glob to a regex and match.
+    /// Independent of our hot-path matcher, so a proptest can assert the
+    /// two agree across a large random space (ROADMAP §7 acceptance #2).
+    fn reference_match(pattern: &str, candidate: &str) -> bool {
+        let mut re = String::with_capacity(pattern.len() + 2);
+        re.push('^');
+        let bytes = pattern.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'*' => {
+                    re.push_str(".*");
+                    i += 1;
+                }
+                b'?' => {
+                    re.push('.');
+                    i += 1;
+                }
+                b'[' => {
+                    if let Some(close_rel) = bytes[i + 1..].iter().position(|&b| b == b']') {
+                        let set = &bytes[i + 1..i + 1 + close_rel];
+                        re.push('[');
+                        for &b in set {
+                            // Inside `[…]` regex needs `\\` and `]` escaped.
+                            if b == b'\\' || b == b']' {
+                                re.push('\\');
+                            }
+                            re.push(b as char);
+                        }
+                        re.push(']');
+                        i += 1 + close_rel + 1;
+                    } else {
+                        // Unclosed bracket = literal `[`. regex needs it escaped.
+                        re.push_str("\\[");
+                        i += 1;
+                    }
+                }
+                c => {
+                    // Escape regex metacharacters.
+                    if matches!(
+                        c,
+                        b'.' | b'+' | b'(' | b')' | b'|' | b'^' | b'$' | b'{' | b'}' | b'\\'
+                    ) {
+                        re.push('\\');
+                    }
+                    re.push(c as char);
+                    i += 1;
+                }
+            }
+        }
+        re.push('$');
+        // Reference is regex; compile lazily.
+        regex::Regex::new(&re)
+            .map(|r| r.is_match(candidate))
+            .unwrap_or(false)
+    }
 
     fn b(s: &str) -> Bytes {
         Bytes::copy_from_slice(s.as_bytes())
@@ -758,5 +816,88 @@ mod tests {
         let acks = p.subscribe(id, &[b("x")]);
         assert_eq!(acks[0].total_subscriptions, 1);
         assert_eq!(p.pubsub_numsub(&[b("x")])[0].1, 1);
+    }
+
+    // ROADMAP §7 acceptance #2: pattern subscription correctness suite.
+    //
+    // Properties:
+    //   1. `pattern_matches` agrees with the regex-based reference impl on
+    //      a wide random space.
+    //   2. A literal pattern (no glob metas) matches exactly the same
+    //      candidate.
+    //   3. `*` swallows arbitrary infixes — `a*b` matches `a<anything>b`
+    //      for every random infix.
+    //   4. `?` matches exactly one character — `a?b` matches `a<c>b` for
+    //      every single c, never `ab` and never `axxb`.
+    //   5. Negated charclass excludes — `[^xyz]` does NOT match `x`, `y`, `z`.
+
+    /// Patterns drawn from the documented glob alphabet plus literal ASCII.
+    fn pattern_strategy() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just("*".to_string()),
+                Just("?".to_string()),
+                Just("[ab]".to_string()),
+                Just("[^xy]".to_string()),
+                "[a-z]{1,3}".prop_map(String::from),
+            ],
+            0..=6,
+        )
+        .prop_map(|parts| parts.concat())
+    }
+
+    /// Candidate strings — ASCII lowercase keeps the regex reference
+    /// honest (it doesn't need to worry about UTF-8 multi-byte chars).
+    fn candidate_strategy() -> impl Strategy<Value = String> {
+        "[a-z]{0,16}".prop_map(String::from)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn matcher_agrees_with_regex_reference(
+            pattern in pattern_strategy(),
+            candidate in candidate_strategy(),
+        ) {
+            let ours = pattern_matches(&pattern, &candidate);
+            let theirs = reference_match(&pattern, &candidate);
+            prop_assert_eq!(
+                ours,
+                theirs,
+                "pattern={:?} candidate={:?}",
+                pattern,
+                candidate,
+            );
+        }
+
+        #[test]
+        fn literal_pattern_matches_itself(s in "[a-z]{1,16}") {
+            prop_assert!(pattern_matches(&s, &s));
+        }
+
+        #[test]
+        fn star_swallows_arbitrary_infix(infix in "[a-z]{0,16}") {
+            let pattern = "a*b";
+            let candidate = format!("a{infix}b");
+            prop_assert!(pattern_matches(pattern, &candidate));
+        }
+
+        #[test]
+        fn question_matches_exactly_one_char(c in b'a'..=b'z') {
+            let candidate: String = format!("a{}b", c as char);
+            prop_assert!(pattern_matches("a?b", &candidate));
+            // ... and never zero or two
+            prop_assert!(!pattern_matches("a?b", "ab"));
+            let cc = c as char;
+            let too_long = format!("a{cc}{cc}b");
+            prop_assert!(!pattern_matches("a?b", &too_long));
+        }
+
+        #[test]
+        fn negated_charclass_excludes(c in proptest::sample::select(vec!['x', 'y', 'z'])) {
+            let s = format!("{c}");
+            prop_assert!(!pattern_matches("[^xyz]", &s));
+        }
     }
 }
