@@ -61,10 +61,11 @@ impl From<String> for BulkString {
     }
 }
 
-/// One RESP frame. RESP3-only variants (`Map`, `Set`, `Push`, `Boolean`,
-/// `Double`, `BigNumber`, and `Null`) MUST NOT be emitted on a RESP2
-/// connection — the codec returns [`crate::ProtocolError::Resp3Required`]
-/// if you try.
+/// One RESP frame.
+///
+/// RESP3-only variants (`Map`, `Set`, `Push`, `Boolean`, `Double`,
+/// `BigNumber`, and `Null`) MUST NOT be emitted on a RESP2 connection —
+/// the codec returns [`crate::ProtocolError::Resp3Required`] if you try.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     /// `+OK\r\n` etc.
